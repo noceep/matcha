@@ -1,0 +1,524 @@
+-- kill any previous instance first (so re-executing never stacks scripts)
+if _G.SP_STOP then pcall(_G.SP_STOP) end
+
+local alive = true
+
+--========================================--
+-- TUNING
+--========================================--
+
+local LOOP_DT    = 1/120
+local SCAN_DT    = 1/40
+local LIST_DT    = 0.25
+local SWEEP_DT   = 0.5
+local WIN_BACK   = 10
+local WIN_FWD    = 60
+local SWEEP_FAR  = 60
+local MOVE_SCALE = 1.0
+
+-- range     : 3D distance (studs) from cursor to note before the script acts
+-- gain      : pull strength
+-- max_speed : cap on assist speed (px/sec)
+-- response  : velocity smoothing in seconds (higher = softer)
+-- fade_in / fade_out : screen px under which assist is full / beyond which it is zero
+-- acquire   : seconds to ramp the pull in after a new note is picked (kills the "snap")
+-- offset_px : radius (px) of the random aim point around the note when off-center is ON
+local MODES = {
+    closet = {
+        range = 16, gain = 8,  max_speed = 600,  response = 0.06,
+        fade_in = 40, fade_out = 170, acquire = 0.05, offset_px = 8,
+    },
+    semi = {
+        range = 18, gain = 14, max_speed = 1100, response = 0.035,
+        fade_in = 30, fade_out = 230, acquire = 0.10, offset_px = 7,
+    },
+    blatant = {
+        range = 20, gain = 28, max_speed = 9000, response = 0.02,
+        fade_in = 1e9, fade_out = 1e9 + 1, acquire = 0, offset_px = 3,
+    },
+}
+
+local ORDER  = {"closet", "semi", "blatant"}
+local COLORS = {
+    closet  = Color3.fromRGB(90, 200, 255),
+    semi    = Color3.fromRGB(170, 120, 255),
+    blatant = Color3.fromRGB(255, 90, 110),
+}
+
+-- keys (Windows virtual-key codes)
+local KEY_CLOSET  = 0x46 -- F
+local KEY_SEMI    = 0x47 -- G
+local KEY_BLATANT = 0x48 -- H
+local KEY_TOGGLE  = 0x4A -- J  assist on/off
+local KEY_OFFSET  = 0x4B -- K  off-center on/off
+local KEY_KILL    = 0x23 -- End  kill script
+
+local currentMode = "semi"
+local enabled     = true
+local offset_on   = true
+
+--========================================--
+-- UI (DRAWING API)
+--========================================--
+
+local Players = game:GetService("Players")
+local player  = Players.LocalPlayer
+local mouse   = player:GetMouse()
+
+local ui = {}
+local origin = Vector2.new(20, 270)
+local PANEL_W, PANEL_H = 300, 128
+
+local function mk(kind, rel, props)
+    local o = Drawing.new(kind)
+    for k, v in pairs(props) do o[k] = v end
+    o.Position = origin + rel
+    o.Visible = true
+    ui[#ui + 1] = { o = o, rel = rel }
+    return o
+end
+
+local function layout()
+    for _, e in ipairs(ui) do
+        e.o.Position = origin + e.rel
+    end
+end
+
+local bg = mk("Square", Vector2.new(0, 0), {
+    Size = Vector2.new(PANEL_W, PANEL_H), Filled = true, Corner = 8,
+    Color = Color3.fromRGB(18, 18, 24), Transparency = 0.6, ZIndex = 10,
+})
+local accent = mk("Square", Vector2.new(0, 0), {
+    Size = Vector2.new(PANEL_W, 3), Filled = true, ZIndex = 12,
+    Color = COLORS[currentMode],
+})
+local title = mk("Text", Vector2.new(12, 9), {
+    Text = "SP  //  aim assist", Size = 16, Outline = true, ZIndex = 20,
+    Color = Color3.fromRGB(255, 255, 255), Font = Drawing.Fonts.UI,
+})
+local dot = mk("Square", Vector2.new(PANEL_W - 22, 12), {
+    Size = Vector2.new(10, 10), Filled = true, Corner = 5, ZIndex = 20,
+    Color = Color3.fromRGB(80, 255, 140),
+})
+
+local pills, pillTexts = {}, {}
+local pillLabels = { closet = "F  closet", semi = "G  semi", blatant = "H  blatant" }
+for i, name in ipairs(ORDER) do
+    local x = 12 + (i - 1) * 94
+    pills[name] = mk("Square", Vector2.new(x, 34), {
+        Size = Vector2.new(88, 24), Filled = true, Corner = 6, ZIndex = 15,
+        Color = Color3.fromRGB(45, 45, 56),
+    })
+    pillTexts[name] = mk("Text", Vector2.new(x + 10, 38), {
+        Text = pillLabels[name], Size = 14, Outline = true, ZIndex = 20,
+        Color = Color3.fromRGB(255, 255, 255), Font = Drawing.Fonts.UI,
+    })
+end
+
+local assistText = mk("Text", Vector2.new(12, 68), {
+    Size = 14, Outline = true, ZIndex = 20,
+    Color = Color3.fromRGB(230, 230, 235), Font = Drawing.Fonts.UI,
+})
+local offsetText = mk("Text", Vector2.new(150, 68), {
+    Size = 14, Outline = true, ZIndex = 20,
+    Color = Color3.fromRGB(230, 230, 235), Font = Drawing.Fonts.UI,
+})
+mk("Text", Vector2.new(12, 88), {
+    Text = "End  kill script", Size = 14, Outline = true, ZIndex = 20,
+    Color = Color3.fromRGB(255, 120, 130), Font = Drawing.Fonts.UI,
+})
+local statsText = mk("Text", Vector2.new(12, 108), {
+    Text = "...", Size = 12, Outline = true, ZIndex = 20,
+    Color = Color3.fromRGB(150, 230, 170), Font = Drawing.Fonts.UI,
+})
+
+local function RefreshUI()
+    local col = COLORS[currentMode]
+    accent.Color = col
+    for _, name in ipairs(ORDER) do
+        pills[name].Color = (name == currentMode) and col or Color3.fromRGB(45, 45, 56)
+    end
+    dot.Color = enabled and Color3.fromRGB(80, 255, 140) or Color3.fromRGB(255, 80, 80)
+    assistText.Text = "J  assist: " .. (enabled and "ON" or "OFF")
+    offsetText.Text = "K  off-center: " .. (offset_on and "ON" or "OFF")
+end
+RefreshUI()
+
+--========================================--
+-- SAFE READ HELPERS
+--========================================--
+
+local function getpos(i) return i.Position end
+local function getparent(i) return i.Parent end
+local function note_pos(c)
+    if c.Name == "" and c:IsA("Part") then return c.Position end
+    return nil
+end
+
+local function valid(inst)
+    if not inst then return false end
+    local ok, p = pcall(getparent, inst)
+    return ok and p ~= nil
+end
+
+--========================================--
+-- SHARED CACHE
+--========================================--
+
+local folder   = nil
+local children = {}
+local n        = 0
+local cursor   = nil
+local target   = nil
+local hint     = 1
+local need_sweep   = false
+local sweep_result = nil
+local sweep_count  = 0
+local last_cursor_try = 0
+
+local function refresh_list()
+    if not valid(folder) then
+        folder = nil
+        local client = workspace:FindFirstChild("Client")
+        folder = client and client:FindFirstChild("Game")
+    end
+    if not folder then
+        children, n, cursor, target = {}, 0, nil, nil
+        return
+    end
+
+    local old = target
+    children = folder:GetChildren()
+    n = #children
+
+    if old then
+        local found = nil
+        for i = math.max(1, hint - 80), math.min(n, hint + 80) do
+            if children[i] == old then found = i break end
+        end
+        hint = found or math.max(1, hint - 40)
+    end
+    if hint > n then hint = math.max(1, n) end
+
+    if not valid(cursor) then
+        cursor = nil
+        local now = tick()
+        if now - last_cursor_try > 1 then
+            last_cursor_try = now
+            for i = 1, n do
+                local c = children[i]
+                if c.Name == "Cursor" and #c:GetChildren() > 0 then
+                    cursor = c
+                    break
+                end
+                if i % 64 == 0 then task.wait() end
+            end
+        end
+    end
+end
+
+local last_list = 0
+local scan_ms_avg = 0
+
+local function scan_once()
+    local now = tick()
+    if now - last_list > LIST_DT then
+        last_list = now
+        refresh_list()
+    end
+    if not cursor or n == 0 then
+        target = nil
+        return
+    end
+
+    local okc, cpos = pcall(getpos, cursor)
+    if not okc or not cpos then cursor = nil return end
+    local cx, cy, cz = cpos.X, cpos.Y, cpos.Z
+
+    local lo = math.max(1, hint - WIN_BACK)
+    local hi = math.min(n, hint + WIN_FWD)
+    local best, best_i, best_d2 = nil, nil, math.huge
+
+    for i = lo, hi do
+        local ok, p = pcall(note_pos, children[i])
+        if ok and p then
+            local dx, dy, dz = p.X - cx, p.Y - cy, p.Z - cz
+            local d2 = dx*dx + dy*dy + dz*dz
+            if d2 < best_d2 then
+                best, best_i, best_d2 = children[i], i, d2
+            end
+        end
+    end
+
+    if best and best_d2 <= SWEEP_FAR * SWEEP_FAR then
+        hint = best_i
+        target = best
+        sweep_result = nil
+    else
+        if best then target = best hint = best_i else target = nil end
+        if sweep_result then
+            hint = sweep_result
+            sweep_result = nil
+        else
+            need_sweep = true
+        end
+    end
+end
+
+task.spawn(function()
+    local last_err = nil
+    while alive do
+        if enabled and isrbxactive() then
+            local t0 = tick()
+            local ok, err = pcall(scan_once)
+            scan_ms_avg = scan_ms_avg * 0.95 + (tick() - t0) * 1000 * 0.05
+            if not ok and err ~= last_err then
+                last_err = err
+                warn("[SP] scan error: " .. tostring(err))
+            end
+        end
+        task.wait(SCAN_DT)
+    end
+end)
+
+local function sweep()
+    local list, cnt = children, n
+    if not cursor or cnt == 0 then return end
+    local okc, cpos = pcall(getpos, cursor)
+    if not okc or not cpos then return end
+    local cx, cy, cz = cpos.X, cpos.Y, cpos.Z
+
+    local best_i, best_d2 = nil, math.huge
+    local reads = 0
+    for i = 1, cnt, 3 do
+        if not alive then return end
+        local ok, p = pcall(note_pos, list[i])
+        if ok and p then
+            local dx, dy, dz = p.X - cx, p.Y - cy, p.Z - cz
+            local d2 = dx*dx + dy*dy + dz*dz
+            if d2 < best_d2 then best_i, best_d2 = i, d2 end
+        end
+        reads = reads + 1
+        if reads % 48 == 0 then task.wait() end
+    end
+    sweep_result = best_i
+    sweep_count = sweep_count + 1
+end
+
+task.spawn(function()
+    local last_err = nil
+    while alive do
+        task.wait(SWEEP_DT)
+        if need_sweep and enabled and isrbxactive() then
+            need_sweep = false
+            local ok, err = pcall(sweep)
+            if not ok and err ~= last_err then
+                last_err = err
+                warn("[SP] sweep error: " .. tostring(err))
+            end
+        end
+    end
+end)
+
+--========================================--
+-- MOVEMENT
+--========================================--
+
+local vel_x, vel_y = 0, 0
+local acc_x, acc_y = 0, 0
+
+local function trunc(v)
+    if v >= 0 then return math.floor(v) else return math.ceil(v) end
+end
+
+local function send_move(dx, dy)
+    acc_x = acc_x + dx
+    acc_y = acc_y + dy
+    local ix, iy = trunc(acc_x), trunc(acc_y)
+    if ix ~= 0 or iy ~= 0 then
+        acc_x = acc_x - ix
+        acc_y = acc_y - iy
+        mousemoverel(ix, iy)
+    end
+end
+
+local last_tick = tick()
+local step_ms_avg = 0
+
+-- per-target state: when a new note is picked we ramp the pull in and pick a fixed aim offset
+local last_tgt = nil
+local acq_time = 0
+local off_ux, off_uy = 0, 0 -- unit-disc sample, scaled by offset_px
+
+local function step()
+    local now = tick()
+    local dt = math.clamp(now - last_tick, 0.001, 0.05)
+    last_tick = now
+
+    local s = MODES[currentMode]
+    local want_x, want_y = 0, 0
+
+    local cur, tgt = cursor, target
+    if cur and tgt and valid(tgt) then
+        if tgt ~= last_tgt then
+            last_tgt = tgt
+            acq_time = now
+            local a = math.random() * math.pi * 2
+            local r = math.sqrt(math.random())
+            off_ux, off_uy = math.cos(a) * r, math.sin(a) * r
+        end
+
+        local ok1, cpos = pcall(getpos, cur)
+        local ok2, spos = pcall(getpos, tgt)
+        if ok1 and ok2 and cpos and spos then
+            local dx, dy, dz = spos.X - cpos.X, spos.Y - cpos.Y, spos.Z - cpos.Z
+            local d3 = math.sqrt(dx*dx + dy*dy + dz*dz)
+
+            if d3 < s.range then
+                local sp, on1 = WorldToScreen(spos)
+                local cp, on2 = WorldToScreen(cpos)
+                if on1 and on2 then
+                    local aimx, aimy = sp.X, sp.Y
+                    if offset_on then
+                        aimx = aimx + off_ux * s.offset_px
+                        aimy = aimy + off_uy * s.offset_px
+                    end
+
+                    local ex, ey = aimx - cp.X, aimy - cp.Y
+                    local dist = math.sqrt(ex*ex + ey*ey)
+
+                    local strength = 1
+                    if dist > s.fade_in then
+                        local t = math.clamp((dist - s.fade_in) / (s.fade_out - s.fade_in), 0, 1)
+                        strength = 1 - t * t * (3 - 2 * t)
+                    end
+
+                    local ramp = 1
+                    if s.acquire > 0 then
+                        local t = math.clamp((now - acq_time) / s.acquire, 0, 1)
+                        ramp = t * t * (3 - 2 * t)
+                    end
+
+                    want_x = ex * s.gain * strength * ramp
+                    want_y = ey * s.gain * strength * ramp
+
+                    local mag = math.sqrt(want_x*want_x + want_y*want_y)
+                    if mag > s.max_speed then
+                        local f = s.max_speed / mag
+                        want_x, want_y = want_x * f, want_y * f
+                    end
+                end
+            end
+        end
+    else
+        last_tgt = nil
+    end
+
+    local a = 1 - math.exp(-dt / s.response)
+    vel_x = vel_x + (want_x - vel_x) * a
+    vel_y = vel_y + (want_y - vel_y) * a
+
+    send_move(vel_x * dt * MOVE_SCALE, vel_y * dt * MOVE_SCALE)
+end
+
+task.spawn(function()
+    local last_err = nil
+    while alive do
+        if enabled and isrbxactive() then
+            local t0 = tick()
+            local ok, err = pcall(step)
+            step_ms_avg = step_ms_avg * 0.95 + (tick() - t0) * 1000 * 0.05
+            if not ok and err ~= last_err then
+                last_err = err
+                warn("[SP] error: " .. tostring(err))
+            end
+        else
+            vel_x, vel_y = 0, 0
+            last_tick = tick()
+        end
+        task.wait(LOOP_DT)
+    end
+end)
+
+--========================================--
+-- KILL
+--========================================--
+
+local function kill()
+    if not alive then return end
+    alive = false
+    vel_x, vel_y = 0, 0
+    for _, e in ipairs(ui) do
+        pcall(function() e.o:Remove() end)
+    end
+    ui = {}
+    if _G.SP_STOP == kill then _G.SP_STOP = nil end
+    print("[SP] killed")
+end
+_G.SP_STOP = kill
+
+--========================================--
+-- KEYBINDS + DRAGGING + STATS
+--========================================--
+
+local was = { f = false, g = false, h = false, j = false, k = false, e = false }
+local dragging = false
+local dragStart, boxStart
+local lastMouse1 = false
+local last_stats = 0
+
+task.spawn(function()
+    while alive do
+        task.wait()
+
+        if isrbxactive() then
+            local f = iskeypressed(KEY_CLOSET)
+            local g = iskeypressed(KEY_SEMI)
+            local h = iskeypressed(KEY_BLATANT)
+            local j = iskeypressed(KEY_TOGGLE)
+            local k = iskeypressed(KEY_OFFSET)
+            local e = iskeypressed(KEY_KILL)
+
+            if f and not was.f then currentMode = "closet"  RefreshUI() end
+            if g and not was.g then currentMode = "semi"    RefreshUI() end
+            if h and not was.h then currentMode = "blatant" RefreshUI() end
+            if j and not was.j then enabled = not enabled   RefreshUI() end
+            if k and not was.k then offset_on = not offset_on RefreshUI() end
+            if e and not was.e then kill() return end
+            was.f, was.g, was.h, was.j, was.k, was.e = f, g, h, j, k, e
+
+            local m1 = ismouse1pressed()
+            if m1 then
+                local mPos = Vector2.new(mouse.X, mouse.Y)
+                if not lastMouse1 then
+                    if mPos.X >= origin.X and mPos.X <= origin.X + PANEL_W
+                       and mPos.Y >= origin.Y and mPos.Y <= origin.Y + PANEL_H then
+                        dragging = true
+                        dragStart = mPos
+                        boxStart = origin
+                    end
+                end
+                if dragging then
+                    origin = boxStart + (mPos - dragStart)
+                    layout()
+                end
+            else
+                dragging = false
+            end
+            lastMouse1 = m1
+
+            local now = tick()
+            if now - last_stats > 1 then
+                last_stats = now
+                statsText.Text = string.format("notes %d  step %.2fms  scan %.2fms  sweeps %d",
+                    n, step_ms_avg, scan_ms_avg, sweep_count)
+            end
+        else
+            for key in pairs(was) do was[key] = false end
+            dragging = false
+            lastMouse1 = false
+        end
+    end
+end)
+
+print("[SP] loaded. F closet | G semi | H blatant | J on/off | K off-center | End kill")
