@@ -1,4 +1,4 @@
--- kill any previous instance first (so re-executing never stacks scripts)
+-- kill any previous instance first
 if _G.SP_STOP then pcall(_G.SP_STOP) end
 
 local alive = true
