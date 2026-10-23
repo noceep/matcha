@@ -45,7 +45,7 @@ local COLORS = {
     blatant = Color3.fromRGB(255, 90, 110),
 }
 
--- keys (Windows virtual-key codes)
+-- keys
 local KEY_CLOSET  = 0x46 -- F
 local KEY_SEMI    = 0x47 -- G
 local KEY_BLATANT = 0x48 -- H
