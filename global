@@ -1,0 +1,1379 @@
+--[[
+    SPV  |  made by mna08
+    Aim assist
+    Supports Matcha !
+]]
+
+-- unload any previous instance
+if _G.SPV_STOP then pcall(_G.SPV_STOP) end
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local player           = Players.LocalPlayer
+local tick             = os.clock
+local alive            = true
+
+local MAUI_URL = "https://raw.githubusercontent.com/noceep/MaUI/main/dist/MaUI.lua"
+local okLib, MaUI = pcall(function() return loadstring(game:HttpGet(MAUI_URL))() end)
+if not okLib or type(MaUI) ~= "table" then
+    warn("[SPV] could not load MaUI: " .. tostring(MaUI))
+    return
+end
+
+local ui = MaUI.new({ Name = "SPV", ConfigFolder = "SPV" })
+ui.Maid:Give(function() alive = false end)
+
+--========================================--
+-- EXECUTOR HELPERS
+--========================================--
+
+local function rbx_active()
+    if isrbxactive then return isrbxactive() end
+    if iswindowactive then return iswindowactive() end
+    return true
+end
+
+-- 3D -> 2D (replaces Matcha's WorldToScreen); returns Vector2, onScreen
+local function w2s(pos)
+    local cam = workspace.CurrentCamera
+    if not cam then return Vector2.new(0, 0), false end
+    local v, on = cam:WorldToViewportPoint(pos)
+    return Vector2.new(v.X, v.Y), on and v.Z > 0
+end
+
+local function say(msg, kind)
+    pcall(function()
+        ui:Notify({ Title = "SPV", Content = msg, Type = kind or "Info", Duration = 1.5 })
+    end)
+end
+
+if not mousemoverel then
+    ui:Notify({ Title = "SPV", Content = "Your executor has no mousemoverel. SPV cannot move the mouse.", Type = "Error", Duration = 8 })
+end
+
+--========================================--
+-- SETTINGS
+--========================================--
+
+local C = {
+    SCAN_DT = 1/40, LIST_DT = 0.25,
+    WIN_BACK = 10, WIN_FWD = 80, SWEEP_FAR = 60, LOCATE_R = 150,
+    LOST_AFTER = 0.10, SWEEP_GAP = 0.05, SWEEP_IDLE = 0.15,
+    PASS_MARGIN = 5, SKIP_TIME = 1.5,
+
+    DEPTH_AXIS = 1, PICK_BY_DEPTH = true, AIM_AT_PLANE = true,
+
+    CROWD_DEPTH = 10, CROWD_REF = 6, LATE_START = 60, LATE_FULL = 360,
+    BOOST_ATTACK = 0.08, BOOST_RELEASE = 0.50,
+
+    U_TAU = 0.05, U_DEAD = 120, U_FULL = 600,
+
+    -- No Wait planner
+    NW_MAX = 24, NW_MINGAP = 0.035, NW_TENSION = 0.8, NW_PASS = 0.04,
+    QPASS = 0.5, SPEED_DT = 0.08,
+    NW_IN_ASSIST = false,   -- true = Assist also uses the No Wait planner
+
+    -- Flow path + pattern recognition
+    MERGE_D = 0.5, MERGE_T = 0.30, REANCHOR_D = 0.75, CELL = 2.0, VIB_SHRINK = 0.78,
+}
+
+local PAT_TENS = {
+    off = C.NW_TENSION, none = C.NW_TENSION, single = C.NW_TENSION, mixed = C.NW_TENSION,
+    stack = 0.9, spiral = 1.0, slide = 0.95, jump = 0.35, vibro = 0.0, burst = 1.0,
+}
+
+-- fade_in / fade_out (assist presets only): screen px under which pull is full / beyond which it is zero
+local MODES = {
+    closet = {
+        range = 24, reach = 4,  floor = 0.35, smooth_time = 0.07,  soft = 1.5, max_speed = 1800, accel = 1.8,
+        curve = 0.16, lead = 0.40, straight = 0.08, acquire = 0.04, offset_px = 8,
+        miss_chance = 0.08, miss_px = 110, deadzone = 3,
+        shape = 0.80, wobble = 0.15, sway = 6, solo = 0.70, with_user = 0.90, against = 0.20, tvar = 35,
+    },
+    semi = {
+        range = 24, reach = 6,  floor = 0.55, smooth_time = 0.045, soft = 1.0, max_speed = 3500, accel = 2.6,
+        curve = 0.11, lead = 0.45, straight = 0.12, acquire = 0.03, offset_px = 7,
+        miss_chance = 0.03, miss_px = 100, deadzone = 4,
+        shape = 0.60, wobble = 0.10, sway = 4, solo = 0.90, with_user = 1.00, against = 0.45, tvar = 22,
+    },
+    blatant = {
+        range = 24, reach = 10, floor = 1.0,  smooth_time = 0.03,  soft = 1.0, max_speed = 9000, accel = 1.0,
+        curve = 0,    lead = 0.50, straight = 1.0,  acquire = 0,    offset_px = 3,
+        miss_chance = 0, miss_px = 0, deadzone = 5,
+        shape = 0, wobble = 0, sway = 1.5, solo = 1, with_user = 1, against = 1, tvar = 8,
+    },
+    a_light = {
+        range = 20, reach = 4, floor = 0.25, smooth_time = 0.09, soft = 1.5, max_speed = 700, accel = 1.2,
+        curve = 0.16, lead = 0.35, straight = 0.10, acquire = 0.05, offset_px = 8,
+        miss_chance = 0, miss_px = 0, deadzone = 4,
+        shape = 0.8, wobble = 0.15, sway = 3, solo = 0.45, with_user = 0.85, against = 0.10, tvar = 35,
+        fade_in = 30, fade_out = 140,
+    },
+    a_strong = {
+        range = 22, reach = 6, floor = 0.45, smooth_time = 0.06, soft = 1.2, max_speed = 1400, accel = 1.5,
+        curve = 0.11, lead = 0.40, straight = 0.12, acquire = 0.03, offset_px = 6,
+        miss_chance = 0, miss_px = 0, deadzone = 4,
+        shape = 0.6, wobble = 0.10, sway = 2, solo = 0.65, with_user = 1.0, against = 0.25, tvar = 22,
+        fade_in = 40, fade_out = 200,
+    },
+}
+
+local LEVELS = {
+    assist = { "a_light", "a_strong" },
+    auto   = { "semi", "blatant" },
+}
+local DESC = {
+    assist = { "Light help.", "Strong help that follows your mouse." },
+    auto   = { "Plays for you with a natural feel.", "Fully blatant." },
+}
+
+local RAND = {
+    curve_min = 0.50, curve_max = 1.30,
+    frac_min  = 0.35, frac_max  = 0.65,
+    pow_min   = 1.6,  pow_max   = 2.6,
+    lead_var  = 0.15,
+    st_min    = 0.92, st_max    = 1.12,
+}
+
+local IDLE = { delay = 0.4, ax = 30, ay = 18, smooth_time = 0.30, max_speed = 100 }
+
+--========================================--
+-- STATE (driven by the menu callbacks)
+--========================================--
+
+local style, level = "assist", 2
+local enabled, human_on, curve_on, drift_on = true, true, true, true
+local nowait_on, flow_on, pat_on = true, true, true
+
+local T = {
+    speed = 1, smooth = 1, range = 1, accel = 1, pull = 1, var = 1, curve = 1,
+    drift = 1, spread = 1, miss = 1, still = 1, toward = 1, away = 1, sens = 1,
+    look = 0.9, bias = 0, tvar = 1, nspeed = 0,
+}
+
+--========================================--
+-- MOTION LIB
+--========================================--
+
+local function smoothDamp2(tx, ty, vx, vy, smoothTime, maxSpeed, dt)
+    smoothTime = math.max(0.0001, smoothTime)
+    local omega = 2 / smoothTime
+    local x = omega * dt
+    local e = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x)
+
+    local cx, cy = -tx, -ty
+    local maxChange = maxSpeed * smoothTime
+    local mag = math.sqrt(cx * cx + cy * cy)
+    if mag > maxChange and mag > 0 then
+        local f = maxChange / mag
+        cx, cy = cx * f, cy * f
+    end
+    local tgx, tgy = -cx, -cy
+
+    local tmpx = (vx + omega * cx) * dt
+    local tmpy = (vy + omega * cy) * dt
+    local nvx = (vx - omega * tmpx) * e
+    local nvy = (vy - omega * tmpy) * e
+    local ox = tgx + (cx + tmpx) * e
+    local oy = tgy + (cy + tmpy) * e
+
+    if tx * (ox - tx) + ty * (oy - ty) > 0 then
+        ox, oy = tx, ty
+        nvx, nvy = 0, 0
+    end
+    return ox, oy, nvx, nvy
+end
+
+local function bez(p0, p1, p2, t)
+    local u = 1 - t
+    return u * u * p0 + 2 * u * t * p1 + t * t * p2
+end
+
+local function arcControl(x0, y0, x2, y2, curve, frac)
+    local dx, dy = x2 - x0, y2 - y0
+    return x0 + dx * frac - dy * curve, y0 + dy * frac + dx * curve
+end
+
+local function rrange(a, b) return a + math.random() * (b - a) end
+
+local function comp(v, a)
+    if a == 1 then return v.X elseif a == 2 then return v.Y else return v.Z end
+end
+
+-- the two sideways (grid) coordinates of a world position
+local function lat2(p)
+    local a = C.DEPTH_AXIS
+    if a == 1 then return p.Y, p.Z
+    elseif a == 2 then return p.X, p.Z
+    else return p.X, p.Y end
+end
+
+local function plane_point(spos, cpos)
+    local a = C.DEPTH_AXIS
+    return Vector3.new(
+        a == 1 and cpos.X or spos.X,
+        a == 2 and cpos.Y or spos.Y,
+        a == 3 and cpos.Z or spos.Z
+    )
+end
+
+--========================================--
+-- SAFE READ HELPERS
+--========================================--
+
+local function getpos(i) return i.Position end
+local function getparent(i) return i.Parent end
+local function is_note(c) return c.Name == "" and c:IsA("Part") end
+local function note_ok(c)
+    local ok, r = pcall(is_note, c)
+    return ok and r
+end
+
+local function valid(inst)
+    if not inst then return false end
+    local ok, p = pcall(getparent, inst)
+    return ok and p ~= nil
+end
+
+--========================================--
+-- NOTE TRACKING
+--========================================--
+
+local folder   = nil
+local children = {}
+local n        = 0
+local cursor   = nil
+local target   = nil
+local tgt_min_d = 1e9
+local skip     = {}
+local hint     = 1
+local sweep_result = nil
+local sweep_found  = false
+local last_cursor_try = 0
+local lost_since   = 0
+local crowd_n      = 0
+local FAR2 = C.SWEEP_FAR * C.SWEEP_FAR
+
+local EMPTYQ = { n = 0 }
+local queue  = EMPTYQ
+local hist   = {}
+local votes  = { 0, 0 }
+local dsign  = 1
+local speed  = nil
+local speed_announced = false
+local cc, cp_, cs_, smp = {}, {}, {}, {}
+
+local function refresh_list()
+    if not valid(folder) then
+        folder = nil
+        local client = workspace:FindFirstChild("Client")
+        folder = client and client:FindFirstChild("Game")
+    end
+    if not folder then
+        children, n, cursor, target = {}, 0, nil, nil
+        return
+    end
+
+    local old = target
+    children = folder:GetChildren()
+    n = #children
+
+    if old then
+        local found = nil
+        for i = math.max(1, hint - 80), math.min(n, hint + 80) do
+            if children[i] == old then found = i break end
+        end
+        hint = found or math.max(1, hint - 40)
+    end
+    if hint > n then hint = math.max(1, n) end
+
+    if not valid(cursor) then
+        cursor = nil
+        local now = tick()
+        if now - last_cursor_try > 0.5 then
+            last_cursor_try = now
+            for i = 1, n do
+                local c = children[i]
+                if c.Name == "Cursor" and #c:GetChildren() > 0 then
+                    cursor = c
+                    break
+                end
+                if i % 64 == 0 then task.wait() end
+            end
+        end
+    end
+end
+
+local function adopt_sweep()
+    local inst = sweep_result
+    sweep_result = nil
+    if not inst then return end
+    for i = 1, n do
+        if children[i] == inst then
+            hint = math.max(1, i - C.WIN_BACK)
+            return
+        end
+    end
+end
+
+-- one pass over the window: counts crowding, measures how fast notes approach,
+-- and builds the queue of upcoming notes sorted by arrival
+local function build_queue(now, cpos)
+    local cd = comp(cpos, C.DEPTH_AXIS)
+    local lo = math.max(1, hint - C.WIN_BACK)
+    local hi = math.min(n, hint + C.WIN_FWD)
+    local newhist = {}
+    local cnt, ns, crowd = 0, 0, 0
+
+    for i = lo, hi do
+        local c = children[i]
+        local ok, p = pcall(getpos, c)
+        if ok and p then
+            local s = comp(p, C.DEPTH_AXIS) - cd
+            if math.abs(s) <= C.CROWD_DEPTH then crowd = crowd + 1 end
+            local h = hist[c]
+            if h then
+                local dtt = now - h.t
+                if dtt >= C.SPEED_DT then
+                    local d = (math.abs(h.s) - math.abs(s)) / dtt
+                    if d > 1 and d < 3000 and h.s * s > 0 then
+                        ns = ns + 1
+                        smp[ns] = d
+                        local k = (h.s > 0) and 1 or 2
+                        votes[k] = votes[k] + 1
+                    end
+                    h.s, h.t = s, now
+                end
+                newhist[c] = h
+            else
+                newhist[c] = { s = s, t = now }
+            end
+            cnt = cnt + 1
+            cc[cnt], cp_[cnt], cs_[cnt] = c, p, s
+        end
+    end
+
+    hist = newhist
+    crowd_n = crowd
+    votes[1], votes[2] = votes[1] * 0.998, votes[2] * 0.998
+    dsign = (votes[1] >= votes[2]) and 1 or -1
+
+    if ns >= 3 then
+        for j = #smp, ns + 1, -1 do smp[j] = nil end
+        table.sort(smp)
+        local med = smp[math.floor((ns + 1) / 2)]
+        speed = speed and (speed + (med - speed) * 0.2) or med
+        if not speed_announced then
+            speed_announced = true
+            print(string.format("[SPV] note speed locked: %.0f studs/s", speed))
+        end
+    end
+
+    local spd = (T.nspeed > 0) and T.nspeed or speed
+    if not spd or spd < 1 then queue = EMPTYQ return end
+
+    local maxsd = spd * (T.look + 0.2)
+    local qc, qp, qs, qn = {}, {}, {}, 0
+    for i = 1, cnt do
+        local sd = cs_[i] * dsign
+        if sd > -C.QPASS and sd <= maxsd then
+            local pos = qn + 1
+            while pos > 1 and qs[pos - 1] > sd do pos = pos - 1 end
+            if pos <= C.NW_MAX then
+                table.insert(qc, pos, cc[i])
+                table.insert(qp, pos, cp_[i])
+                table.insert(qs, pos, sd)
+                qn = qn + 1
+                if qn > C.NW_MAX then
+                    qc[qn], qp[qn], qs[qn] = nil, nil, nil
+                    qn = C.NW_MAX
+                end
+            end
+        end
+    end
+
+    local fc, fp, fs, fn = {}, {}, {}, 0
+    for i = 1, qn do
+        if note_ok(qc[i]) then
+            fn = fn + 1
+            fc[fn], fp[fn], fs[fn] = qc[i], qp[i], qs[i]
+        end
+    end
+    queue = { n = fn, t0 = now, c = fc, p = fp, sd = fs }
+end
+
+local last_list = 0
+
+local function scan_once()
+    local now = tick()
+    if now - last_list > C.LIST_DT then
+        last_list = now
+        refresh_list()
+        for k, t in pairs(skip) do
+            if now - t > C.SKIP_TIME then skip[k] = nil end
+        end
+    end
+    if not cursor or n == 0 then
+        target = nil
+        crowd_n = 0
+        queue = EMPTYQ
+        return
+    end
+
+    local okc, cpos = pcall(getpos, cursor)
+    if not okc or not cpos then cursor = nil return end
+    local cx, cy, cz = cpos.X, cpos.Y, cpos.Z
+
+    build_queue(now, cpos)
+
+    if target then
+        if skip[target] or not valid(target) then
+            target = nil
+        else
+            local ok, p = pcall(getpos, target)
+            if ok and p then
+                local dx, dy, dz = p.X - cx, p.Y - cy, p.Z - cz
+                local d = math.sqrt(dx*dx + dy*dy + dz*dz)
+                if d < tgt_min_d then tgt_min_d = d end
+                if d > tgt_min_d + C.PASS_MARGIN or d > C.SWEEP_FAR then
+                    skip[target] = now
+                    target = nil
+                end
+            else
+                target = nil
+            end
+        end
+        if target then
+            lost_since = 0
+            return
+        end
+    end
+
+    local lo = math.max(1, hint - C.WIN_BACK)
+    local hi = math.min(n, hint + C.WIN_FWD)
+    local best, best_i, best_score = nil, nil, math.huge
+    local cdepth = comp(cpos, C.DEPTH_AXIS)
+
+    for i = lo, hi do
+        local c = children[i]
+        if not skip[c] then
+            local ok, p = pcall(getpos, c)
+            if ok and p then
+                local dx, dy, dz = p.X - cx, p.Y - cy, p.Z - cz
+                local d2 = dx*dx + dy*dy + dz*dz
+                if d2 <= FAR2 then
+                    local score = d2
+                    if C.PICK_BY_DEPTH then
+                        local dd = math.abs(comp(p, C.DEPTH_AXIS) - cdepth)
+                        local lat = math.sqrt(math.max(d2 - dd*dd, 0))
+                        score = dd + 0.1 * lat
+                    end
+                    if score < best_score and note_ok(c) then
+                        best, best_i, best_score = c, i, score
+                    end
+                end
+            end
+        end
+    end
+
+    if best then
+        target = best
+        hint = best_i
+        local ok, p = pcall(getpos, best)
+        if ok and p then
+            local dx, dy, dz = p.X - cx, p.Y - cy, p.Z - cz
+            tgt_min_d = math.sqrt(dx*dx + dy*dy + dz*dz)
+        else
+            tgt_min_d = 1e9
+        end
+        sweep_result = nil
+        lost_since = 0
+    else
+        if lost_since == 0 then lost_since = now end
+        if sweep_result then adopt_sweep() end
+    end
+end
+
+task.spawn(function()
+    local last_err = nil
+    while alive do
+        if enabled and rbx_active() then
+            local ok, err = pcall(scan_once)
+            if not ok and err ~= last_err then
+                last_err = err
+                warn("[SPV] scan error: " .. tostring(err))
+            end
+        end
+        task.wait(C.SCAN_DT)
+    end
+end)
+
+local function sweep()
+    local list, cnt = children, n
+    if not cursor or cnt == 0 then return end
+    local okc, cpos = pcall(getpos, cursor)
+    if not okc or not cpos then return end
+    local cx, cy, cz = cpos.X, cpos.Y, cpos.Z
+
+    local best_inst, best_d2 = nil, C.LOCATE_R * C.LOCATE_R
+    local reads = 0
+    for i = 1, cnt do
+        if not alive then return end
+        local c = list[i]
+        if not skip[c] then
+            local ok, p = pcall(getpos, c)
+            if ok and p then
+                local dx, dy, dz = p.X - cx, p.Y - cy, p.Z - cz
+                local d2 = dx*dx + dy*dy + dz*dz
+                if d2 < best_d2 and note_ok(c) then best_inst, best_d2 = c, d2 end
+            end
+        end
+        reads = reads + 1
+        if reads % 100 == 0 then task.wait() end
+    end
+    sweep_result = best_inst
+    sweep_found = best_inst ~= nil
+end
+
+task.spawn(function()
+    local last_err = nil
+    while alive do
+        task.wait(sweep_found and C.SWEEP_GAP or C.SWEEP_IDLE)
+        if enabled and rbx_active() and lost_since ~= 0 and (tick() - lost_since) > C.LOST_AFTER then
+            local ok, err = pcall(sweep)
+            if not ok and err ~= last_err then
+                last_err = err
+                warn("[SPV] sweep error: " .. tostring(err))
+            end
+        end
+    end
+end)
+
+--========================================--
+-- FLOW: STOPS + PATTERN RECOGNITION
+--========================================--
+
+-- a "stop" = one distinct position; stacked notes at the same spot merge into one stop
+local g_n = 0
+local GL1, GL2, GFT, GLT, GN, GC, GK, GP = {}, {}, {}, {}, {}, {}, {}, {}
+local SL = {}
+local g_q, g_spd, g_bias, g_flow, g_pat = nil, nil, nil, nil, nil
+local pat_name, pat_step, pat_stack = "none", 0, 1
+
+local function build_stops(q, spd, bias, merge)
+    local gn = 0
+    local qt0 = q.t0
+    local md2 = C.MERGE_D * C.MERGE_D
+    for i = 1, q.n do
+        local raw = qt0 + q.sd[i] / spd - bias
+        local p = q.p[i]
+        local l1, l2 = lat2(p)
+        local merged = false
+        if merge and gn > 0 then
+            local d1, d2 = l1 - GL1[gn], l2 - GL2[gn]
+            if d1 * d1 + d2 * d2 <= md2 and raw - GLT[gn] <= C.MERGE_T then
+                GLT[gn] = raw
+                GN[gn] = GN[gn] + 1
+                GK[gn] = q.c[i]
+                merged = true
+            end
+        end
+        if not merged then
+            gn = gn + 1
+            GL1[gn], GL2[gn] = l1, l2
+            GFT[gn], GLT[gn] = raw, raw
+            GN[gn] = 1
+            GC[gn], GK[gn], GP[gn] = q.c[i], q.c[i], p
+        end
+    end
+    for k = gn + 1, #GC do GC[k], GK[k], GP[k] = nil, nil, nil end
+    return gn
+end
+
+-- looks at the next few stops and names the pattern
+local function classify(gn)
+    local stacks = 1
+    for k = 1, gn do if GN[k] > stacks then stacks = GN[k] end end
+    if gn < 2 then return (stacks > 1) and "stack" or "single", 0, stacks end
+
+    local m = math.min(gn, 6)
+    local sum, mingap = 0, 1e9
+    for k = 1, m - 1 do
+        local dx, dy = GL1[k + 1] - GL1[k], GL2[k + 1] - GL2[k]
+        local len = math.sqrt(dx * dx + dy * dy)
+        SL[k] = len
+        sum = sum + len
+        local gap = (GFT[k + 1] + GLT[k + 1]) * 0.5 - (GFT[k] + GLT[k]) * 0.5
+        if gap < mingap then mingap = gap end
+    end
+    local avg = sum / (m - 1)
+
+    -- vibro: A B A B
+    if m >= 3 then
+        local ab = 0
+        for k = 1, m - 2 do
+            local dx, dy = GL1[k + 2] - GL1[k], GL2[k + 2] - GL2[k]
+            if SL[k] > C.MERGE_D and math.sqrt(dx * dx + dy * dy) < 0.3 * SL[k] then ab = ab + 1 end
+        end
+        if ab == m - 2 then return "vibro", avg, stacks end
+    end
+
+    -- burst: stops arrive faster than anyone could read them
+    if m >= 3 and mingap < 0.09 then return "burst", avg, stacks end
+
+    -- turning direction + straightness
+    if m >= 3 then
+        local pos, neg, turning, straight = 0, 0, 0, 0
+        for k = 1, m - 2 do
+            local la, lb = SL[k], SL[k + 1]
+            if la > 1e-3 and lb > 1e-3 then
+                local ax, ay = GL1[k + 1] - GL1[k], GL2[k + 1] - GL2[k]
+                local bx, by = GL1[k + 2] - GL1[k + 1], GL2[k + 2] - GL2[k + 1]
+                local c  = (ax * bx + ay * by) / (la * lb)
+                local cr = (ax * by - ay * bx) / (la * lb)
+                if c > 0.6 then straight = straight + 1 end
+                if c > -0.3 and c < 0.97 then
+                    turning = turning + 1
+                    if cr > 0 then pos = pos + 1 else neg = neg + 1 end
+                end
+            end
+        end
+        if m >= 4 and turning == m - 2 and (pos == turning or neg == turning) and avg < 2.2 * C.CELL then
+            return "spiral", avg, stacks
+        end
+        if straight == m - 2 and avg <= 1.3 * C.CELL then return "slide", avg, stacks end
+    end
+
+    if avg >= 1.6 * C.CELL then return "jump", avg, stacks end
+    return "mixed", avg, stacks
+end
+
+--========================================--
+-- MOVEMENT
+--========================================--
+
+local vel_x, vel_y = 0, 0
+local acc_x, acc_y = 0, 0
+
+local function trunc(v)
+    if v >= 0 then return math.floor(v) else return math.ceil(v) end
+end
+
+local function send_move(dx, dy)
+    acc_x = acc_x + dx
+    acc_y = acc_y + dy
+    local ix, iy = trunc(acc_x), trunc(acc_y)
+    if ix ~= 0 or iy ~= 0 then
+        acc_x = acc_x - ix
+        acc_y = acc_y - iy
+        if mousemoverel then mousemoverel(ix, iy) end
+    end
+end
+
+local last_tick = tick()
+
+local last_tgt = nil
+local acq_time = 0
+local off_ux, off_uy = 0, 0
+local n_off_px = 0
+local arc_pending = false
+local arc_p0x, arc_p0y = 0, 0
+local arc_start = 1
+local arc_sign = 1
+local n_curve, n_frac, n_pow, n_lead, n_st = 0, 0.5, 2, 0.4, 1
+local wob_f1, wob_f2, wob_p1, wob_p2 = 1, 2, 0, 0
+
+local function roll_note(s)
+    arc_sign = (math.random() < 0.5) and -1 or 1
+    if math.random() < s.straight then
+        n_curve = 0
+    else
+        n_curve = s.curve * T.curve * rrange(RAND.curve_min, RAND.curve_max)
+    end
+    n_frac = rrange(RAND.frac_min, RAND.frac_max)
+    n_pow  = rrange(RAND.pow_min, RAND.pow_max)
+    n_lead = math.clamp(s.lead * rrange(1 - RAND.lead_var, 1 + RAND.lead_var), 0, 1)
+    n_st   = rrange(RAND.st_min, RAND.st_max)
+    wob_f1, wob_f2 = rrange(2.5, 5), rrange(6, 10)
+    wob_p1, wob_p2 = math.random() * 6.283, math.random() * 6.283
+    local a = math.random() * math.pi * 2
+    if math.random() < s.miss_chance * T.miss then
+        off_ux, off_uy = math.cos(a), math.sin(a)
+        n_off_px = s.miss_px
+    else
+        local r = math.sqrt(math.random())
+        off_ux, off_uy = math.cos(a) * r, math.sin(a) * r
+        n_off_px = s.offset_px * T.spread
+    end
+end
+
+-- per-stop aim offset and timing error, rolled once when a stop is first planned
+local ninfo = {}
+local info_key = nil
+local info_prune = 0
+
+local function note_info(k, base)
+    local key = math.floor(GL1[k] * 4 + 0.5) * 100003 + math.floor(GL2[k] * 4 + 0.5)
+    local t = GFT[k]
+    local info = ninfo[key]
+    if info and math.abs(t - info.t) < 0.6 then return info end
+
+    local a = math.random() * math.pi * 2
+    local ux, uy, px
+    if math.random() < base.miss_chance * T.miss then
+        ux, uy, px = math.cos(a), math.sin(a), base.miss_px
+    else
+        local r = math.sqrt(math.random())
+        ux, uy, px = math.cos(a) * r, math.sin(a) * r, base.offset_px * T.spread
+    end
+    info = { ux = ux, uy = uy, px = px, t = t,
+             tn = (math.random() * 2 - 1) * base.tvar * T.tvar / 1000 }
+    ninfo[key] = info
+
+    local now = tick()
+    if now - info_prune > 3 then
+        info_prune = now
+        for kk, v in pairs(ninfo) do
+            if v.t < now - 2 then ninfo[kk] = nil end
+        end
+    end
+    return info
+end
+
+-- planned path through the upcoming stops (index 0 = where the cursor was when the plan started)
+local PT, PX, PY, PS = {}, {}, {}, {}
+local anchor_x, anchor_y, anchor_t, anchor_vx, anchor_vy = 0, 0, 0, 0, 0
+local last_fl1, last_fl2 = nil, nil
+
+local function eval_path(tq, m, tens)
+    if tq <= PT[0] then return PX[0], PY[0] end
+    local k = 0
+    while k < m - 1 and tq >= PT[k + 1] do k = k + 1 end
+    local t0, t1 = PT[k], PT[k + 1]
+    local h = t1 - t0
+    local u = math.min(1, (tq - t0) / h)
+
+    local m0x, m0y, m1x, m1y = 0, 0, 0, 0
+    if tens > 0 then
+        if k == 0 then
+            m0x, m0y = anchor_vx * 0.6, anchor_vy * 0.6
+        else
+            local d = PT[k + 1] - PT[k - 1]
+            local sc = tens * PS[k]
+            m0x = (PX[k + 1] - PX[k - 1]) / d * sc
+            m0y = (PY[k + 1] - PY[k - 1]) / d * sc
+        end
+        local sc1 = tens * PS[k + 1]
+        if k + 1 < m then
+            local d = PT[k + 2] - PT[k]
+            m1x = (PX[k + 2] - PX[k]) / d * sc1
+            m1y = (PY[k + 2] - PY[k]) / d * sc1
+        else
+            m1x = (PX[k + 1] - PX[k]) / h * sc1
+            m1y = (PY[k + 1] - PY[k]) / h * sc1
+        end
+    end
+
+    local u2 = u * u
+    local u3 = u2 * u
+    local h00 = 2 * u3 - 3 * u2 + 1
+    local h10 = u3 - 2 * u2 + u
+    local h01 = -2 * u3 + 3 * u2
+    local h11 = u3 - u2
+    local x = h00 * PX[k] + h10 * h * m0x + h01 * PX[k + 1] + h11 * h * m1x
+    local y = h00 * PY[k] + h10 * h * m0y + h01 * PY[k + 1] + h11 * h * m1y
+    if tq > t1 then
+        local e = math.min(tq - t1, 0.12)
+        x, y = x + m1x * e * 0.5, y + m1y * e * 0.5
+    end
+    return x, y
+end
+
+local SW_F = { rrange(1.2, 2.4), rrange(2.8, 4.5), rrange(1.0, 2.2), rrange(2.5, 4.2) }
+local SW_P = { math.random() * 6.283, math.random() * 6.283, math.random() * 6.283, math.random() * 6.283 }
+
+local last_active = tick()
+local idle_ox, idle_oy = 0, 0
+local idle_t0 = nil
+local idle_p, idle_f, idle_a, idle_b0x, idle_b0y
+
+local function idle_wave(t)
+    local x = idle_a[1] * (math.sin(math.pi * 2 * idle_f[1] * t + idle_p[1]) * 0.7
+                         + math.sin(math.pi * 2 * idle_f[2] * t + idle_p[2]) * 0.3)
+    local y = idle_a[2] * (math.sin(math.pi * 2 * idle_f[3] * t + idle_p[3]) * 0.7
+                         + math.sin(math.pi * 2 * idle_f[4] * t + idle_p[4]) * 0.3)
+    return x, y
+end
+
+local function new_idle(now)
+    idle_t0 = now
+    idle_p = { math.random() * 6.283, math.random() * 6.283, math.random() * 6.283, math.random() * 6.283 }
+    idle_f = { rrange(0.12, 0.45), rrange(0.4, 0.9), rrange(0.10, 0.40), rrange(0.35, 0.85) }
+    idle_a = { IDLE.ax * T.drift * rrange(0.5, 1), IDLE.ay * T.drift * rrange(0.5, 1) }
+    idle_b0x, idle_b0y = idle_wave(0)
+end
+
+local function reset_idle()
+    idle_ox, idle_oy = 0, 0
+    idle_t0 = nil
+end
+
+local boost = 1
+local prev_csx, prev_csy = nil, nil
+local cvx, cvy = 0, 0
+local asx, asy = 0, 0
+local last_ax, last_ay = 0, 0
+local user_vx, user_vy = 0, 0
+
+local function step()
+    local now = tick()
+    local dt = math.clamp(now - last_tick, 0.001, 0.05)
+    last_tick = now
+
+    local base = MODES[LEVELS[style][level]]
+    local auto = (style == "auto")
+    if info_key ~= base then
+        info_key = base
+        ninfo = {}
+    end
+
+    local range      = base.range * T.range
+    local accel      = 1 + (base.accel - 1) * T.accel
+    local floor0     = math.clamp(base.floor * T.pull, 0, 1)
+    local shape      = math.clamp(base.shape * T.var, 0, 1)
+    local wobble_amt = base.wobble * T.var
+    local sway_amt   = base.sway * T.drift
+    local solo       = base.solo * T.still
+    local with_user  = base.with_user * T.toward
+    local against    = base.against * T.away
+    local move_scale = T.sens
+
+    local tx, ty = 0, 0
+    local active = false
+    local gapfrac = 0
+    local pressure = 0
+    local prof = 1
+
+    local cposF, csx, csy = nil, nil, nil
+    if cursor then
+        local okp, p = pcall(getpos, cursor)
+        if okp and p then
+            cposF = p
+            local sc, on = w2s(p)
+            if on then csx, csy = sc.X, sc.Y end
+        end
+    end
+
+    if csx and prev_csx then
+        local a = 1 - math.exp(-dt / C.U_TAU)
+        cvx = cvx + ((csx - prev_csx) / dt - cvx) * a
+        cvy = cvy + ((csy - prev_csy) / dt - cvy) * a
+        asx = asx + (last_ax - asx) * a
+        asy = asy + (last_ay - asy) * a
+        user_vx, user_vy = cvx - asx, cvy - asy
+    else
+        cvx, cvy, asx, asy, user_vx, user_vy = 0, 0, 0, 0, 0, 0
+    end
+    prev_csx, prev_csy = csx, csy
+
+    local uraw = math.sqrt(user_vx * user_vx + user_vy * user_vy)
+    local us = math.max(0, uraw - 0.15 * math.sqrt(asx * asx + asy * asy))
+    local moving = auto and 0 or math.clamp((us - C.U_DEAD) / (C.U_FULL - C.U_DEAD), 0, 1)
+
+    local swx, swy = 0, 0
+    if drift_on and sway_amt > 0 then
+        local f = sway_amt
+        swx = f * (math.sin(now * SW_F[1] + SW_P[1]) * 0.65 + math.sin(now * SW_F[2] + SW_P[2]) * 0.35)
+        swy = f * (math.sin(now * SW_F[3] + SW_P[3]) * 0.65 + math.sin(now * SW_F[4] + SW_P[4]) * 0.35)
+    end
+
+    local pull_floor = math.min(1, floor0 + (1 - floor0) * 0.5 * ((boost - 1) / math.max(accel - 1, 0.001)))
+
+    -- No Wait / Flow: gather stops (merged stacks) with arrival times and aim points
+    local spd = (T.nspeed > 0) and T.nspeed or speed
+    local q = queue
+    local m, kfirst = 0, nil
+    if nowait_on and (auto or C.NW_IN_ASSIST) and spd and q.n > 0 and cposF and csx then
+        if q ~= g_q or spd ~= g_spd or T.bias ~= g_bias or flow_on ~= g_flow or pat_on ~= g_pat then
+            g_q, g_spd, g_bias, g_flow, g_pat = q, spd, T.bias, flow_on, pat_on
+            g_n = build_stops(q, spd, T.bias, flow_on)
+            if pat_on then
+                pat_name, pat_step, pat_stack = classify(g_n)
+            else
+                pat_name, pat_step, pat_stack = "off", 0, 1
+            end
+        end
+
+        local prev_at = -1e9
+        for k = 1, g_n do
+            local info = note_info(k, base)
+            local at = (GFT[k] + GLT[k]) * 0.5 + info.tn
+            if at < prev_at + C.NW_MINGAP then at = prev_at + C.NW_MINGAP end
+            prev_at = at
+            if math.max(at, GLT[k]) > now - C.NW_PASS then
+                local sp, on = w2s(plane_point(GP[k], cposF))
+                if on then
+                    m = m + 1
+                    if m == 1 then kfirst = k end
+                    PT[m] = at
+                    local ax, ay = sp.X, sp.Y
+                    if human_on then
+                        ax = ax + info.ux * info.px
+                        ay = ay + info.uy * info.px
+                    end
+                    PX[m], PY[m] = ax, ay
+                    PS[m] = 1 / (1 + (GLT[k] - GFT[k]) * 10)
+                end
+            end
+            if at > now + T.look then break end
+        end
+
+        -- vibro: swing less than the full distance, like a real shaking hand
+        if pat_name == "vibro" and m >= 2 then
+            local mx_, my_ = (PX[1] + PX[2]) * 0.5, (PY[1] + PY[2]) * 0.5
+            for k = 1, m do
+                PX[k] = mx_ + (PX[k] - mx_) * C.VIB_SHRINK
+                PY[k] = my_ + (PY[k] - my_) * C.VIB_SHRINK
+            end
+        end
+    else
+        pat_name, pat_step, pat_stack = "none", 0, 1
+        g_q = nil
+    end
+
+    local have = false
+    local pathx, pathy, ex, ey, dist = 0, 0, 0, 0, 0
+    local prog = 0
+    local planned = false
+
+    if m > 0 then
+        planned = true
+        have = true
+        last_tgt = nil
+
+        local fl1, fl2 = GL1[kfirst], GL2[kfirst]
+        local restart = true
+        if last_fl1 then
+            local d1, d2 = fl1 - last_fl1, fl2 - last_fl2
+            restart = (d1 * d1 + d2 * d2) > C.REANCHOR_D * C.REANCHOR_D
+        end
+        if restart then
+            last_fl1, last_fl2 = fl1, fl2
+            anchor_x, anchor_y, anchor_t = csx, csy, now
+            anchor_vx, anchor_vy = vel_x, vel_y
+            roll_note(base)
+        end
+
+        local gap1 = math.max(0, (PT[1] - now) * spd)
+        gapfrac = math.clamp(gap1 / base.reach, 0, 1)
+
+        local st_eff = base.smooth_time * T.smooth * n_st / boost
+        local lead = math.clamp(st_eff * 0.9, 0.01, 0.30)
+
+        PT[0] = math.min(anchor_t, PT[1] - 0.05)
+        PX[0], PY[0] = anchor_x, anchor_y
+        local tens = curve_on and (PAT_TENS[pat_name] or C.NW_TENSION) or 0
+        local px, py = eval_path(now + lead, m, tens)
+
+        pathx, pathy = px + swx - csx, py + swy - csy
+        ex, ey = PX[1] + swx - csx, PY[1] + swy - csy
+        dist = math.sqrt(ex * ex + ey * ey)
+    else
+        last_fl1, last_fl2 = nil, nil
+        local cur, tgt = cursor, target
+        if cur and tgt and cposF and valid(tgt) then
+            if tgt ~= last_tgt then
+                last_tgt = tgt
+                acq_time = now
+                arc_pending = true
+                roll_note(base)
+            end
+
+            local cpos = cposF
+            local ok2, spos = pcall(getpos, tgt)
+            if ok2 and spos then
+                local dx, dy, dz = spos.X - cpos.X, spos.Y - cpos.Y, spos.Z - cpos.Z
+                local d3 = math.sqrt(dx*dx + dy*dy + dz*dz)
+
+                if d3 < range then
+                    local aimw = C.AIM_AT_PLANE and plane_point(spos, cpos) or spos
+                    local sp, on1 = w2s(aimw)
+                    if on1 and csx then
+                        have = true
+
+                        local gap = math.abs(comp(spos, C.DEPTH_AXIS) - comp(cpos, C.DEPTH_AXIS))
+                        gapfrac = math.clamp(gap / base.reach, 0, 1)
+
+                        local aimx, aimy = sp.X + swx, sp.Y + swy
+                        if human_on then
+                            aimx = aimx + off_ux * n_off_px
+                            aimy = aimy + off_uy * n_off_px
+                        end
+
+                        ex, ey = aimx - csx, aimy - csy
+                        dist = math.sqrt(ex*ex + ey*ey)
+
+                        if arc_pending then
+                            arc_pending = false
+                            arc_p0x, arc_p0y = csx, csy
+                            arc_start = math.max(dist, 1)
+                        end
+
+                        prog = 1 - math.clamp(dist / arc_start, 0, 1)
+
+                        pathx, pathy = ex, ey
+                        if curve_on and n_curve > 0 and dist > 1 then
+                            local u = 1 - (1 - math.min(1, prog + n_lead)) ^ n_pow
+                            local c1x, c1y = arcControl(arc_p0x, arc_p0y, aimx, aimy, n_curve * arc_sign, n_frac)
+                            pathx = bez(arc_p0x, c1x, aimx, u) - csx
+                            pathy = bez(arc_p0y, c1y, aimy, u) - csy
+                        end
+                    end
+                end
+            end
+        end
+        if not have then last_tgt = nil end
+    end
+
+    if have then
+        active = true
+
+        local ufac = 1
+        if not auto then
+            local toward = 0
+            if uraw > 1 and dist > 1 then
+                toward = (user_vx * ex + user_vy * ey) / (uraw * dist)
+            end
+            local tfrac = (toward + 1) * 0.5
+            local tgtf = against + (with_user - against) * tfrac
+            ufac = solo + (tgtf - solo) * moving
+
+            local blend = moving * 0.7
+            pathx = pathx + (ex - pathx) * blend
+            pathy = pathy + (ey - pathy) * blend
+        end
+
+        local crowdP = math.clamp((crowd_n - 1) / C.CROWD_REF, 0, 1)
+        local lateP  = math.clamp((dist - C.LATE_START) / (C.LATE_FULL - C.LATE_START), 0, 1) * (1 - gapfrac)
+        pressure = math.max(crowdP, lateP)
+
+        local strength
+        if planned then
+            strength = math.clamp(T.pull, 0.2, 1)
+        else
+            local near = 1 - gapfrac
+            strength = pull_floor + (1 - pull_floor) * (near * near * (3 - 2 * near))
+        end
+
+        -- assist only: pull fades with screen distance, so it can't play for you from afar
+        if not auto then
+            local fi = base.fade_in or 1e9
+            local fo = base.fade_out or (fi + 1)
+            if dist > fi then
+                local t = math.clamp((dist - fi) / math.max(fo - fi, 1), 0, 1)
+                strength = strength * (1 - t * t * (3 - 2 * t))
+            end
+        end
+
+        local wob = 1
+        if wobble_amt > 0 then
+            wob = 1 + wobble_amt * (math.sin(now * wob_f1 + wob_p1) * 0.6 + math.sin(now * wob_f2 + wob_p2) * 0.4)
+        end
+
+        local ramp = 1
+        local dz_scale = 0
+        if planned then
+            local pm = math.sqrt(pathx * pathx + pathy * pathy)
+            if pm > base.deadzone then dz_scale = (pm - base.deadzone) / pm end
+        else
+            local bell = math.max(0, math.sin(math.pi * prog)) ^ 0.7
+            prof = (1 - shape) + shape * (0.3 + 0.7 * bell)
+            if base.acquire > 0 then
+                local t = math.clamp((now - acq_time) / (base.acquire / boost), 0, 1)
+                ramp = t * t * (3 - 2 * t)
+            end
+            if dist > base.deadzone then dz_scale = (dist - base.deadzone) / dist end
+        end
+        if drift_on then dz_scale = math.max(dz_scale, 0.35) end
+        local k = strength * ramp * dz_scale * ufac * wob
+        tx = pathx * k
+        ty = pathy * k
+    end
+
+    local bt = 1 + (accel - 1) * pressure
+    local tc = (bt > boost) and C.BOOST_ATTACK or C.BOOST_RELEASE
+    boost = boost + (bt - boost) * (1 - math.exp(-dt / tc))
+    if boost > accel then boost = accel end
+    if boost < 1 then boost = 1 end
+
+    local smooth_time = base.smooth_time * T.smooth * n_st * (planned and 1 or (1 + base.soft * gapfrac)) / boost
+    local max_speed = base.max_speed * T.speed * boost * prof
+    local idling = false
+    if active then
+        last_active = now
+        reset_idle()
+    elseif drift_on and (auto or moving < 0.25) then
+        idling = true
+        if not idle_t0 then new_idle(now) end
+        local wx, wy = idle_wave(now - idle_t0)
+        tx = (wx - idle_b0x) - idle_ox
+        ty = (wy - idle_b0y) - idle_oy
+        smooth_time, max_speed = IDLE.smooth_time, IDLE.max_speed
+    else
+        reset_idle()
+    end
+
+    local mx, my, nvx, nvy = smoothDamp2(tx, ty, vel_x, vel_y, smooth_time, max_speed, dt)
+    vel_x, vel_y = nvx, nvy
+
+    if idling then
+        idle_ox = idle_ox + mx
+        idle_oy = idle_oy + my
+    end
+
+    last_ax, last_ay = mx * move_scale / dt, my * move_scale / dt
+    send_move(mx * move_scale, my * move_scale)
+end
+
+-- main loop: runs every rendered frame
+do
+    local last_err = nil
+    local conn = RunService.RenderStepped:Connect(function()
+        if not alive then return end
+        if enabled and rbx_active() then
+            local ok, err = pcall(step)
+            if not ok and err ~= last_err then
+                last_err = err
+                warn("[SPV] error: " .. tostring(err))
+            end
+        else
+            vel_x, vel_y = 0, 0
+            boost = 1
+            prev_csx, prev_csy = nil, nil
+            last_ax, last_ay = 0, 0
+            last_tick = tick()
+            last_active = tick()
+            last_fl1, last_fl2 = nil, nil
+            reset_idle()
+        end
+    end)
+    ui.Maid:Give(function()
+        conn:Disconnect()
+        vel_x, vel_y = 0, 0
+    end)
+end
+
+--========================================--
+-- MENU (MaUI)
+--========================================--
+
+local el = {}  -- element handles, so hotkeys can update the menu
+
+local function setEl(e, v)
+    if e and e.Set then pcall(e.Set, e, v) end
+end
+
+local function refreshDesc()
+    if el.desc and el.desc.SetValue then
+        pcall(el.desc.SetValue, el.desc, DESC[style][level])
+    end
+end
+
+local function applyStyle(s)
+    style = s
+    setEl(el.style, s == "auto" and "Autoplay" or "Assist")
+    refreshDesc()
+end
+
+local function applyLevel(l)
+    level = l
+    setEl(el.level, l == 2 and "Strong / Instant" or "Light / Smooth")
+    refreshDesc()
+end
+
+local tuneEls = {}
+
+local function buildUI()
+    local window = ui:CreateWindow({
+        Title = "SPV",
+        Version = "v1.0",
+        ToggleKey = Enum.KeyCode.RightControl,
+        CollapseKey = Enum.KeyCode.RightShift,
+    })
+
+    window:AddHome({
+        Changelog = {
+            { Title = "SPV  |  Release", Version = "1.0", Tag = "New", Changes = {
+                "Assist and Autoplay with separate presets",
+                "No Wait planner, flow path and pattern recognition",
+                "Humanize, curved paths and natural drift",
+                "Full fine tuning, configs and themes",
+            } },
+        },
+    })
+
+    window:AddTabSeparator("SPV")
+
+    ----------------------------------------------------------------
+    -- Aim tab
+    ----------------------------------------------------------------
+    local aimTab = window:AddTab({ Name = "Aim", Icon = "bolt" })
+    local cols = aimTab:AddColumns(2)
+
+    local main = cols[1]:AddSection({ Name = "Aim Helper", Icon = "bolt", Desc = "Mode and strength" })
+    el.on = main:AddToggle({ Name = "Enabled", Desc = "Pause or resume", Flag = "sp_on", Default = true,
+        Callback = function(on) enabled = on end })
+    el.style = main:AddDropdown({ Name = "Mode", Items = { "Assist", "Autoplay" }, Default = "Assist", Flag = "sp_style",
+        Callback = function(v)
+            style = (v == "Autoplay") and "auto" or "assist"
+            refreshDesc()
+        end })
+    el.level = main:AddDropdown({ Name = "Strength", Items = { "Light / Smooth", "Strong / Instant" },
+        Default = "Strong / Instant", Flag = "sp_level",
+        Callback = function(v)
+            level = (v == "Strong / Instant") and 2 or 1
+            refreshDesc()
+        end })
+    el.desc = main:AddDataRow({ Name = "Preset", Value = DESC[style][level] })
+
+    local opts = cols[1]:AddSection({ Name = "Options", Icon = "settings" })
+    opts:AddToggle({ Name = "No Wait", Desc = "Plans several notes ahead on a timeline", Flag = "sp_nowait", Default = true,
+        Callback = function(on) nowait_on = on end })
+    opts:AddToggle({ Name = "Flow path", Desc = "Stacked notes become one stop", Flag = "sp_flow", Default = true,
+        Callback = function(on) flow_on = on end })
+    opts:AddToggle({ Name = "Pattern recognition", Desc = "Detects spirals, slides, jumps, vibros, bursts", Flag = "sp_pattern", Default = true,
+        Callback = function(on) pat_on = on end })
+    opts:AddToggle({ Name = "Humanize aim", Desc = "Off-center aim, occasional misses, timing variation", Flag = "sp_human", Default = true,
+        Callback = function(on) human_on = on end })
+    opts:AddToggle({ Name = "Curved paths", Desc = "Cursor flows along smooth curves", Flag = "sp_curve", Default = true,
+        Callback = function(on) curve_on = on end })
+    opts:AddToggle({ Name = "Natural drift", Desc = "Small sway so the cursor is never perfectly still", Flag = "sp_drift", Default = true,
+        Callback = function(on) drift_on = on end })
+
+    local keys = cols[2]:AddSection({ Name = "Hotkeys", Icon = "settings" })
+    keys:AddKeybind({ Name = "Switch Assist / Autoplay", Default = Enum.KeyCode.F, Flag = "kb_style",
+        Callback = function()
+            applyStyle(style == "assist" and "auto" or "assist")
+            say("Mode: " .. (style == "auto" and "Autoplay" or "Assist"))
+        end })
+    keys:AddKeybind({ Name = "Strength 1", Default = Enum.KeyCode.G, Flag = "kb_lv1",
+        Callback = function() applyLevel(1) say("Strength 1") end })
+    keys:AddKeybind({ Name = "Strength 2", Default = Enum.KeyCode.H, Flag = "kb_lv2",
+        Callback = function() applyLevel(2) say("Strength 2") end })
+    keys:AddKeybind({ Name = "No Wait on / off", Default = Enum.KeyCode.N, Flag = "kb_nw",
+        Callback = function()
+            nowait_on = not nowait_on
+            setEl(el.nw, nowait_on)
+            say(nowait_on and "No Wait: ON" or "No Wait: OFF")
+        end })
+    keys:AddKeybind({ Name = "Pause / resume", Default = Enum.KeyCode.J, Flag = "kb_tog",
+        Callback = function()
+            enabled = not enabled
+            setEl(el.on, enabled)
+            say(enabled and "Resumed" or "Paused")
+        end })
+    keys:AddKeybind({ Name = "Unload SPV", Desc = "Destroys the UI and stops the script", Default = Enum.KeyCode.End, Flag = "kb_kill",
+        Callback = function() ui:Destroy() end })
+    keys:AddButton({ Name = "Unload SPV", Style = "Destructive", Confirm = true,
+        Callback = function() ui:Destroy() end })
+
+    local det = cols[2]:AddSection({ Name = "Detected", Icon = "info" })
+    el.pat  = det:AddDataRow({ Name = "Pattern", Value = "none" })
+    el.step = det:AddDataRow({ Name = "Step / Stack", Value = "0.0 studs / x1" })
+
+    local about = cols[2]:AddSection({ Name = "About", Icon = "info" })
+    about:AddDataRow({ Name = "Script", Value = "SPV" })
+    about:AddDataRow({ Name = "Made by", Value = "mna08" })
+    about:AddDataRow({ Name = "Version", Value = "v1.0" })
+
+    ----------------------------------------------------------------
+    -- Tune tab
+    ----------------------------------------------------------------
+    local tuneTab = window:AddTab({ Name = "Tune", Icon = "settings" })
+    local tc = tuneTab:AddColumns(2)
+
+    local function slider(sec, name, desc, flag, key, min, max, def, o)
+        o = o or {}
+        local div = o.Div or 1
+        local e = sec:AddSlider({
+            Name = name, Desc = desc, Min = min, Max = max, Step = o.Step or 1, Default = def,
+            Suffix = o.Suffix, Flag = flag,
+            Callback = function(v) T[key] = v / div end,
+        })
+        T[key] = def / div
+        tuneEls[#tuneEls + 1] = { el = e, key = key, def = def, div = div }
+    end
+
+    local mv = tc[1]:AddSection({ Name = "Movement", Icon = "bolt" })
+    slider(mv, "Speed", "Top cursor speed", "t_speed", "speed", 20, 250, 100, { Suffix = "%" })
+    slider(mv, "Smoothness", "Higher = softer and slower to settle", "t_smooth", "smooth", 30, 300, 100, { Suffix = "%" })
+    slider(mv, "Reaction range", "How early it starts moving toward a note", "t_range", "range", 40, 200, 100, { Suffix = "%" })
+    slider(mv, "Acceleration", "How much it speeds up on busy sections", "t_accel", "accel", 0, 200, 100, { Suffix = "%" })
+    slider(mv, "Mouse sensitivity", "Raise if the cursor undershoots, lower if it overshoots", "t_sens", "sens", 0.25, 4, 1, { Step = 0.05 })
+
+    local fe = tc[1]:AddSection({ Name = "Feel", Icon = "bolt" })
+    slider(fe, "Pull strength", "Base amount of help", "t_pull", "pull", 20, 160, 100, { Suffix = "%" })
+    slider(fe, "Speed variation", "0 = steady speed, higher = more natural", "t_var", "var", 0, 200, 100, { Suffix = "%" })
+    slider(fe, "Path curvature", "Strength of arcs when No Wait is off", "t_curve", "curve", 0, 200, 100, { Suffix = "%" })
+    slider(fe, "Drift amount", "Strength of the natural sway", "t_drift", "drift", 0, 250, 100, { Suffix = "%" })
+
+    local nw = tc[2]:AddSection({ Name = "No Wait", Icon = "refresh" })
+    el.nw = nil
+    slider(nw, "Look-ahead", "How far ahead it plans notes", "t_look", "look", 300, 2000, 900, { Suffix = " ms", Div = 1000 })
+    slider(nw, "Arrival bias", "Positive = reach notes earlier, negative = later", "t_bias", "bias", -60, 80, 0, { Suffix = " ms", Div = 1000 })
+    slider(nw, "Timing variation", "How much each stop's timing is off", "t_tvar", "tvar", 0, 300, 100, { Suffix = "%" })
+    slider(nw, "Note speed (0 = auto)", "Set by hand only if auto detection fails", "t_nspeed", "nspeed", 0, 400, 0)
+
+    local hu = tc[2]:AddSection({ Name = "Humanize", Icon = "user" })
+    slider(hu, "Aim spread", "How far from the center it aims", "t_spread", "spread", 0, 250, 100, { Suffix = "%" })
+    slider(hu, "Miss chance", "Scales how often it misses on purpose", "t_miss", "miss", 0, 300, 100, { Suffix = "%" })
+
+    local ar = tc[2]:AddSection({ Name = "Assist response", Icon = "user" })
+    slider(ar, "Help while still", "Help when your mouse isn't moving", "t_still", "still", 0, 150, 100, { Suffix = "%" })
+    slider(ar, "Help toward note", "Help when you move toward a note", "t_toward", "toward", 0, 150, 100, { Suffix = "%" })
+    slider(ar, "Help away from note", "Lower lets you override it", "t_away", "away", 0, 150, 100, { Suffix = "%" })
+    ar:AddButton({ Name = "Reset fine tuning", Style = "Secondary", Confirm = true, Callback = function()
+        for _, t in ipairs(tuneEls) do
+            T[t.key] = t.def / t.div
+            setEl(t.el, t.def)
+        end
+        say("Fine tuning reset", "Success")
+    end })
+
+    ----------------------------------------------------------------
+    -- Island (shows while the window is hidden)
+    ----------------------------------------------------------------
+    ui:CreateIsland({ Window = window, Icon = "bolt", Text = "SPV" })
+end
+
+buildUI()
+
+-- keep the "Detected" rows live (twice a second, no per-frame UI work)
+task.spawn(function()
+    while alive do
+        if el.pat and el.pat.SetValue then
+            pcall(el.pat.SetValue, el.pat, pat_name)
+        end
+        if el.step and el.step.SetValue then
+            pcall(el.step.SetValue, el.step, string.format("%.1f studs / x%d", pat_step, pat_stack))
+        end
+        task.wait(0.5)
+    end
+end)
+
+--========================================--
+-- UNLOAD + LOAD
+--========================================--
+
+_G.SPV_STOP = function()
+    pcall(function() ui:Destroy() end)
+end
+ui.Maid:Give(function()
+    alive = false
+    if _G.SPV_STOP then _G.SPV_STOP = nil end
+    print("[SPV] unloaded")
+end)
+
+ui:LoadAutoload()
+ui:Notify({ Title = "SPV", Content = "Loaded. Made by mna08 aka destroyl. RightControl hides the window.", Type = "Success", Duration = 4 })
+print("[SPV] loaded. made by mna08 aka destroyl")
