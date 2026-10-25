@@ -4,6 +4,7 @@ local MY_GEN = _G.SP_GEN
 if _G.SP_STOP then pcall(_G.SP_STOP) end
 
 local alive = true
+UNLOAD_REQ = false
 
 --========================================--
 -- SETTINGS (plain globals, to stay under the 200-local limit)
@@ -55,6 +56,7 @@ VIB_SHRINK = 0.78
 WEAVE_CALM = 44
 WEAVE_BUSY = 12
 
+
 -- fail-safe (Assist): seconds before a note lands at which the save starts ramping up
 -- (scaled by the Fail-safe sensitivity slider)
 FS_WINDOW = 0.25
@@ -90,9 +92,9 @@ MODES = {
 
 MODE_KEYS = { "assist", "light", "blatant" }
 DESC = {
-    "You aim, it helps. Follows your mouse.",
+    "Simply aim-assist",
     "Plays for you with a natural feel.",
-    "Full auto. Maximum accuracy.",
+    "Fully blatant",
 }
 
 RAND = {
@@ -112,10 +114,8 @@ KEY_TOGGLE  = 0x4A -- J
 KEY_NOWAIT  = 0x4E -- N
 KEY_KILL    = 0x23 -- End
 
-TAB_MAIN   = "SP"
-TAB_AUTO   = "AP"
-TAB_ASSIST = "AS"
-TAB_TUNE   = "Tune"
+TAB_MAIN = "SP"
+TAB_SET  = "Set"
 
 --========================================--
 -- STATE
@@ -134,14 +134,6 @@ local pat_on      = true
 local weave_on    = true
 local failsafe_on = true
 
-local TUNE_DEF = {
-    t_speed = 100, t_smooth = 100, t_range = 100, t_accel = 100,
-    t_pull = 100, t_var = 100, t_curve = 100, t_drift = 100,
-    t_spread = 100, t_miss = 100,
-    t_still = 100, t_toward = 100, t_away = 100,
-    t_look = 900, t_bias = 0, t_tvar = 100, t_nspeed = 0,
-    t_hit = 60, t_idle = 100, t_weave = 100, t_fs = 100, t_fov = 250,
-}
 local T = {
     speed = 1, smooth = 1, range = 1, accel = 1, pull = 1, var = 1, curve = 1,
     drift = 1, spread = 1, miss = 1, still = 1, toward = 1, away = 1, sens = 1,
@@ -159,13 +151,34 @@ SYNC = {
     { "t_hit",    "hit",    100 }, { "t_idle",   "idle",   100 }, { "t_weave",  "weave",  100 },
     { "t_fs",     "fs",     100 }, { "t_fov",    "fov",    1 },
 }
-SYNCI = {}
-for _, s in ipairs(SYNC) do SYNCI[s[1]] = s end
+
+-- default loaded config (also the "Legit AP" preset)
+LEG = {
+    sp_mode = 1, sp_hit = false,
+    t_speed = 180, t_smooth = 180, t_range = 200, t_accel = 30, t_sens = 3.15,
+    t_pull = 70, t_var = 25, t_curve = 200, t_drift = 60, t_hit = 60, t_idle = 175,
+    t_look = 2000, t_bias = 0, t_nspeed = 0, t_weave = 235,
+    t_tvar = 80, t_spread = 230, t_miss = 0,
+    t_still = 100, t_toward = 100, t_away = 100, t_fs = 100, t_fov = 250,
+}
+
+-- toggles that presets don't touch
+DEF = {
+    sp_on = true, sp_human = true, sp_curve = true, sp_drift = true, sp_idle = true,
+    sp_nowait = true, sp_flow = true, sp_pattern = true, sp_weave = true, sp_failsafe = true,
+    sp_fovdraw = false,
+}
+
+-- V = the current value of every menu setting. The menu widgets are created with these values,
+-- so a setting changed while its page isn't on screen is still correct when the page is shown.
+V = {}
+for id, v in pairs(DEF) do V[id] = v end
+for id, v in pairs(LEG) do V[id] = v end
 
 -- weave per-stop data
 local W = { s = {}, n = {}, l = {}, r = {}, a = {} }
--- live values shown in the menu (calm level, fail-safe save level)
-local P = { calm = 0, save = 0, draw = false }
+-- live values shown in the menu
+local P = { calm = 0, save = 0, draw = false, preset = "Legit AP" }
 
 local function gv(id, d)
     local ok, v = pcall(UI.GetValue, id)
@@ -175,28 +188,60 @@ end
 
 local function sv(id, v) pcall(UI.SetValue, id, v) end
 
--- reads the menu. A widget that isn't on screen (its tab is closed) returns nothing,
--- in which case the last known value is kept.
-local function sync()
-    enabled     = gv("sp_on", enabled)
-    mode        = math.clamp(gv("sp_mode", mode - 1) + 1, 1, 3)
-    human_on    = gv("sp_human", human_on)
-    curve_on    = gv("sp_curve", curve_on)
-    drift_on    = gv("sp_drift", drift_on)
-    idle_on     = gv("sp_idle", idle_on)
-    hit_on      = gv("sp_hit", hit_on)
-    nowait_on   = gv("sp_nowait", nowait_on)
-    flow_on     = gv("sp_flow", flow_on)
-    pat_on      = gv("sp_pattern", pat_on)
-    weave_on    = gv("sp_weave", weave_on)
-    failsafe_on = gv("sp_failsafe", failsafe_on)
-    P.draw      = gv("sp_fovdraw", P.draw)
+-- turns the values in V into the script's working variables
+function derive()
+    enabled     = V.sp_on
+    mode        = math.clamp((V.sp_mode or 1) + 1, 1, 3)
+    human_on    = V.sp_human
+    curve_on    = V.sp_curve
+    drift_on    = V.sp_drift
+    idle_on     = V.sp_idle
+    hit_on      = V.sp_hit
+    nowait_on   = V.sp_nowait
+    flow_on     = V.sp_flow
+    pat_on      = V.sp_pattern
+    weave_on    = V.sp_weave
+    failsafe_on = V.sp_failsafe
+    P.draw      = V.sp_fovdraw
 
     for i = 1, #SYNC do
         local s = SYNC[i]
-        local v = gv(s[1], nil)
+        local v = V[s[1]]
         if v ~= nil then T[s[2]] = v / s[3] end
     end
+end
+derive()
+
+LASTW = {}   -- last value each widget showed
+RETRY = {}   -- values a preset is still pushing into a widget
+
+local function sync()
+    local now = tick()
+    for id in pairs(V) do
+        local w = gv(id, nil)
+        if w ~= nil then
+            local last = LASTW[id]
+            if last == nil then
+                LASTW[id] = w
+            elseif w ~= last then
+
+                LASTW[id] = w
+                V[id] = w
+                RETRY[id] = nil
+            else
+                --
+                local r = RETRY[id]
+                if r then
+                    if w == r.v or now > r.t then
+                        RETRY[id] = nil
+                    else
+                        sv(id, r.v)
+                    end
+                end
+            end
+        end
+    end
+    derive()
 end
 
 local function say(msg)
@@ -948,7 +993,6 @@ local function step()
         end
     end
 
-
     local song = (cposF ~= nil) and n > 1
 
     if csx and prev_csx then
@@ -1239,6 +1283,7 @@ local function step()
             P.circ = Drawing.new("Circle")
             P.circ.NumSides = 64
             P.circ.Thickness = 1
+            P.circ.Filled = false
             P.circ.Color = Color3.fromRGB(255, 255, 255)
         end
         P.circ.Position = Vector2.new(csx, csy)
@@ -1316,41 +1361,35 @@ end)
 
 
 local function put(id, v)
+    V[id] = v
     sv(id, v)
-    local s = SYNCI[id]
-    if s then T[s[2]] = v / s[3] return end
-    if id == "sp_nowait" then nowait_on = v
-    elseif id == "sp_flow" then flow_on = v
-    elseif id == "sp_pattern" then pat_on = v
-    elseif id == "sp_weave" then weave_on = v
-    elseif id == "sp_failsafe" then failsafe_on = v
-    elseif id == "sp_fovdraw" then P.draw = v
-    elseif id == "sp_mode" then mode = v + 1
-    end
+    RETRY[id] = { v = v, t = tick() + 1.5 }
+    derive()
 end
 
--- preset script set values from outside
 _G.SP_APPLY = function(values)
     for id, v in pairs(values) do put(id, v) end
 end
 
-local function reset_tuning()
-    for id, v in pairs(TUNE_DEF) do put(id, v) end
-    put("t_sens", 1.0)
-    say("Fine tuning reset")
-end
-
 PRESETS = {
-    human   = { t_tvar = 140, t_spread = 120, t_var = 120, t_drift = 120, t_smooth = 110, t_hit = 60, t_weave = 120 },
-    precise = { t_tvar = 60,  t_spread = 60,  t_var = 80,  t_drift = 70,  t_smooth = 90,  t_miss = 0, t_hit = 70, t_weave = 60 },
+    ["Legit AP"] = LEG,
+    ["Assist Placeholder"] = {
+        sp_mode = 0, sp_hit = false,
+        t_speed = 120, t_smooth = 120, t_range = 120, t_accel = 60, t_sens = 3.15,
+        t_pull = 80, t_var = 60, t_curve = 100, t_drift = 60, t_hit = 60, t_idle = 100,
+        t_look = 900, t_bias = 0, t_nspeed = 0, t_weave = 100,
+        t_tvar = 100, t_spread = 100, t_miss = 0,
+        t_still = 100, t_toward = 100, t_away = 60, t_fs = 100, t_fov = 250,
+    },
 }
 
 local function apply_preset(name)
-    for id, v in pairs(TUNE_DEF) do put(id, v) end
-    put("t_sens", 1.0)
     for id, v in pairs(PRESETS[name]) do put(id, v) end
+    P.preset = name
     say("Preset: " .. name)
 end
+
+local function reset_tuning() apply_preset("Legit AP") end
 
 local kill -- forward declaration
 
@@ -1359,43 +1398,34 @@ local function dead_tab(tab)
     d:Text("Unloaded. Run the script again to load it.")
 end
 
--- secondary tabs: opened from the SP tab, closed from inside themselves.
--- The buttons only set a flag; the loop below adds/removes the tab (never while a tab is being drawn).
-local TB = { want = {}, shown = {}, fn = {} }
-
-TB.close = function(tab, name)
-    local c = tab:Section("Tab", "Right")
-    c:Button("Close tab", function() TB.want[name] = false end)
-end
-
--- MAIN: mode, general feel, tab buttons, hotkeys, live status
+-- MAIN: mode, presets, movement feel toggles, hotkeys, live status
 UI.AddTab(TAB_MAIN, function(tab)
     if not alive then return dead_tab(tab) end
 
     local a = tab:Section("Mode", "Left")
-    a:Toggle("sp_on", "Enabled", true)
+    a:Toggle("sp_on", "Enabled", V.sp_on)
     a:Tip("Pause or resume with J")
-    a:Combo("sp_mode", "Mode", { "Assist", "Autoplay: Light", "Autoplay: Blatant" }, 1)
+    a:Combo("sp_mode", "Mode", { "Assist", "Autoplay: Light", "Autoplay: Blatant" }, V.sp_mode)
     a:Tip("F = Assist, G = Autoplay Light, H = Autoplay Blatant")
     a:Text(DESC[mode])
 
     local o = tab:Section("Movement feel", "Left")
-    o:Toggle("sp_curve", "Smooth curves", true)
+    o:Toggle("sp_curve", "Smooth curves", V.sp_curve)
     o:Tip("Travel along curved paths instead of straight lines")
-    o:Toggle("sp_drift", "Hand drift", true)
+    o:Toggle("sp_drift", "Hand drift", V.sp_drift)
     o:Tip("Tiny constant wobble so the cursor is never perfectly still (only while a song is loaded)")
-    o:Toggle("sp_idle", "Waiting circles", true)
+    o:Toggle("sp_idle", "Waiting circles", V.sp_idle)
     o:Tip("Circles the cursor while no notes are coming (only while a song is loaded)")
-    o:Toggle("sp_hit", "Settle on note", false)
+    o:Toggle("sp_hit", "Settle on note", V.sp_hit)
     o:Tip("Assist: stops pulling while the cursor is already on the note")
-    o:Toggle("sp_human", "Human errors", true)
+    o:Toggle("sp_human", "Human errors", V.sp_human)
     o:Tip("Aims slightly off-center and times notes a bit off")
 
-    local nav = tab:Section("Tabs", "Right")
-    nav:Button("Open Autoplayer tab", function() TB.want[TAB_AUTO] = true end)
-    nav:Button("Open Assist tab", function() TB.want[TAB_ASSIST] = true end)
-    nav:Button("Open tuning tab", function() TB.want[TAB_TUNE] = true end)
-    nav:Text("Each tab has a Close button inside it")
+    local pr = tab:Section("Presets", "Right")
+    pr:Text("Current: " .. P.preset)
+    pr:Button("Legit AP", function() apply_preset("Legit AP") end)
+    pr:Button("Assist Placeholder", function() apply_preset("Assist Placeholder") end)
+    pr:Button("Reset all", reset_tuning)
 
     local h = tab:Section("Hotkeys", "Right")
     h:Text("F   Assist")
@@ -1405,7 +1435,7 @@ UI.AddTab(TAB_MAIN, function(tab)
     h:Text("J   pause / resume")
     h:Text("End unload")
     h:Spacing()
-    h:Button("Unload script", function() if kill then kill() end end)
+    h:Button("Unload script", function() UNLOAD_REQ = true end)
 
     local d = tab:Section("Live status", "Right")
     if mode == 1 then
@@ -1421,119 +1451,81 @@ UI.AddTab(TAB_MAIN, function(tab)
     end
 end)
 
--- AP: everything that only matters when the script plays for you
-TB.fn[TAB_AUTO] = function(tab)
+-- SET: every other setting, grouped into pages inside two sections
+UI.AddTab(TAB_SET, function(tab)
     if not alive then return dead_tab(tab) end
 
-    local l = tab:Section("Look-ahead play", "Left")
-    l:Toggle("sp_nowait", "Look-ahead play", true)
-    l:Tip("Plans several notes ahead instead of waiting for each hit (N)")
-    l:Toggle("sp_flow", "Merge stacks", true)
-    l:Tip("Notes stacked in one spot count as a single stop")
-    l:Toggle("sp_pattern", "Pattern reading", true)
-    l:Tip("Detects spirals, slides, jumps, vibros, bursts and adapts the motion")
-    l:SliderInt("t_look", "Look-ahead (ms)", 300, 2000, 2000)
-    l:Tip("How far ahead it plans notes")
-    l:SliderInt("t_bias", "Arrival bias (ms)", -60, 80, 0)
-    l:Tip("Positive = reach notes earlier, negative = later")
-    l:SliderInt("t_nspeed", "Note speed (0 = auto)", 0, 400, 0)
-    l:Tip("Set by hand only if auto speed detection doesn't work")
+    -- Left: movement, feel, assist
+    local tu = tab:Section("Tune", "Left", { "Movement", "Feel", "Assist" }, 420)
+    if tu.page == 0 then
+        tu:SliderInt("t_speed", "Speed", 20, 250, V.t_speed)
+        tu:Tip("Top cursor speed (%)")
+        tu:SliderInt("t_smooth", "Smoothness", 30, 300, V.t_smooth)
+        tu:Tip("Higher = softer and slower to settle (%)")
+        tu:SliderInt("t_range", "Reaction range", 40, 200, V.t_range)
+        tu:Tip("How early it starts moving toward a note (%)")
+        tu:SliderInt("t_accel", "Acceleration", 0, 200, V.t_accel)
+        tu:Tip("How much it speeds up on busy sections (%)")
+        tu:SliderFloat("t_sens", "Mouse sensitivity", 0.25, 4.0, V.t_sens, "%.2f")
+        tu:Tip("Raise if the cursor undershoots, lower if it overshoots")
+    elseif tu.page == 1 then
+        tu:SliderInt("t_pull", "Pull strength", 20, 160, V.t_pull)
+        tu:Tip("Base amount of help (%)")
+        tu:SliderInt("t_var", "Speed variation", 0, 200, V.t_var)
+        tu:Tip("0 = steady speed, higher = more natural (%)")
+        tu:SliderInt("t_curve", "Path curvature", 0, 200, V.t_curve)
+        tu:Tip("Strength of arcs (%)")
+        tu:SliderInt("t_drift", "Hand drift amount", 0, 250, V.t_drift)
+        tu:Tip("Strength of the constant wobble (%)")
+        tu:SliderInt("t_hit", "Settle zone size", 10, 100, V.t_hit)
+        tu:Tip("Assist: % of the note's half-width where it stops pulling")
+        tu:SliderInt("t_idle", "Waiting circle size", 0, 250, V.t_idle)
+        tu:Tip("Size of the circles while waiting (%)")
+    else
+        tu:Toggle("sp_failsafe", "Fail-safe mode", V.sp_failsafe)
+        tu:Tip("Assist only steps in when a note near the mouse is about to be missed")
+        tu:SliderInt("t_fov", "Fail-safe FOV (px)", 60, 800, V.t_fov)
+        tu:Tip("Radius around the mouse where notes can be saved")
+        tu:SliderInt("t_fs", "Fail-safe sensitivity", 30, 250, V.t_fs)
+        tu:Tip("Higher = steps in earlier before a note lands (%)")
+        tu:Text(string.format("Saving now: %d%%", math.floor(P.save * 100 + 0.5)))
+        tu:Toggle("sp_fovdraw", "Draw FOV", V.sp_fovdraw)
+        tu:Tip("Draws FOV as a circle around the mouse")
+        tu:SliderInt("t_still", "Help while still", 0, 150, V.t_still)
+        tu:Tip("Help when your mouse isn't moving (%)")
+        tu:SliderInt("t_toward", "Help toward note", 0, 150, V.t_toward)
+        tu:Tip("Help when you move toward a note (%)")
+        tu:SliderInt("t_away", "Help away from note", 0, 150, V.t_away)
+        tu:Tip("Help when you move away; lower lets you override it (%)")
+    end
 
-    local w = tab:Section("Calm weave", "Right")
-    w:Toggle("sp_weave", "Calm weave", true)
-    w:Tip("Lazy swings and loops toward each note, timed to arrive on the beat")
-    w:SliderInt("t_weave", "Weave amount", 0, 250, 235)
-    w:Tip("Few notes = big lazy swings, many notes = small timed weaves (%)")
-
-    local e = tab:Section("Human errors", "Right")
-    e:SliderInt("t_tvar", "Timing variation", 0, 300, 80)
-    e:Tip("How much each stop's timing is off (%)")
-    e:SliderInt("t_spread", "Aim spread", 0, 250, 230)
-    e:Tip("How far from the center it aims (%)")
-    e:SliderInt("t_miss", "Miss chance", 0, 300, 0)
-    e:Tip("How often Autoplay: Light misses on purpose (%)")
-
-    TB.close(tab, TAB_AUTO)
-end
-
--- AS: everything that only matters when you do the aiming
-TB.fn[TAB_ASSIST] = function(tab)
-    if not alive then return dead_tab(tab) end
-
-    local f = tab:Section("Fail-safe", "Left")
-    f:Toggle("sp_failsafe", "Fail-safe mode", true)
-    f:Tip("Assist only steps in when a note near the mouse is about to be missed")
-    f:SliderInt("t_fov", "Fail-safe FOV (px)", 60, 800, 250)
-    f:Tip("Radius around the mouse where notes can be saved")
-    f:SliderInt("t_fs", "Fail-safe sensitivity", 30, 250, 100)
-    f:Tip("Higher = steps in earlier before a note lands (%)")
-    f:Text(string.format("Saving now: %d%%", math.floor(P.save * 100 + 0.5)))
-    f:Toggle("sp_fovdraw", "Draw FOV", false)
-    f:Tip("Draws FOV as a circle around the mouse")
-
-    local r = tab:Section("Help level", "Right")
-    r:SliderInt("t_still", "Help while still", 0, 150, 100)
-    r:Tip("Help when your mouse isn't moving (%)")
-    r:SliderInt("t_toward", "Help toward note", 0, 150, 100)
-    r:Tip("Help when you move toward a note (%)")
-    r:SliderInt("t_away", "Help away from note", 0, 150, 100)
-    r:Tip("Help when you move away; lower lets you override it (%)")
-
-    TB.close(tab, TAB_ASSIST)
-end
-
--- Tune
-TB.fn[TAB_TUNE] = function(tab)
-    if not alive then return dead_tab(tab) end
-
-    local m = tab:Section("Movement", "Left")
-    m:SliderInt("t_speed", "Speed", 20, 250, 180)
-    m:Tip("Top cursor speed (%)")
-    m:SliderInt("t_smooth", "Smoothness", 30, 300, 180)
-    m:Tip("Higher = softer and slower to settle (%)")
-    m:SliderInt("t_range", "Reaction range", 40, 200, 200)
-    m:Tip("How early it starts moving toward a note (%)")
-    m:SliderInt("t_accel", "Acceleration", 0, 200, 30)
-    m:Tip("How much it speeds up on busy sections (%)")
-    m:SliderFloat("t_sens", "Mouse sensitivity", 0.25, 4.0, 3.15, "%.2f")
-    m:Tip("Raise if the cursor undershoots, lower if it overshoots")
-
-    local f = tab:Section("Feel", "Right")
-    f:SliderInt("t_pull", "Pull strength", 20, 160, 70)
-    f:Tip("Base amount of help (%)")
-    f:SliderInt("t_var", "Speed variation", 0, 200, 25)
-    f:Tip("0 = steady speed, higher = more natural (%)")
-    f:SliderInt("t_curve", "Path curvature", 0, 200, 200)
-    f:Tip("Strength of arcs (%)")
-    f:SliderInt("t_drift", "Hand drift amount", 0, 250, 60)
-    f:Tip("Strength of the constant wobble (%)")
-    f:SliderInt("t_hit", "Settle zone size", 10, 100, 60)
-    f:Tip("Assist: % of the note's half-width where it stops pulling")
-    f:SliderInt("t_idle", "Waiting circle size", 0, 250, 175)
-    f:Tip("Size of the circles while waiting (%)")
-
-    local p = tab:Section("Presets", "Left")
-    p:Button("Human", function() apply_preset("human") end)
-    p:Button("Precise", function() apply_preset("precise") end)
-    p:Button("Reset all", reset_tuning)
-
-    TB.close(tab, TAB_TUNE)
-end
-
-
-task.spawn(function()
-    while alive do
-        for name, fn in pairs(TB.fn) do
-            local want = TB.want[name] == true
-            if want and not TB.shown[name] then
-                TB.shown[name] = true
-                pcall(UI.AddTab, name, fn)
-            elseif not want and TB.shown[name] then
-                TB.shown[name] = false
-                pcall(UI.RemoveTab, name)
-            end
-        end
-        task.wait(0.05)
+    -- Right: autoplay
+    local au = tab:Section("Autoplay", "Right", { "Look-ahead", "Weave", "Human" }, 420)
+    if au.page == 0 then
+        au:Toggle("sp_nowait", "Look-ahead play", V.sp_nowait)
+        au:Tip("Plans several notes ahead instead of waiting for each hit (N)")
+        au:Toggle("sp_flow", "Merge stacks", V.sp_flow)
+        au:Tip("Notes stacked in one spot count as a single stop")
+        au:Toggle("sp_pattern", "Pattern reading", V.sp_pattern)
+        au:Tip("Detects spirals, slides, jumps, vibros, bursts and adapts the motion")
+        au:SliderInt("t_look", "Look-ahead (ms)", 300, 2000, V.t_look)
+        au:Tip("How far ahead it plans notes")
+        au:SliderInt("t_bias", "Arrival bias (ms)", -60, 80, V.t_bias)
+        au:Tip("Positive = reach notes earlier, negative = later")
+        au:SliderInt("t_nspeed", "Note speed (0 = auto)", 0, 400, V.t_nspeed)
+        au:Tip("Set by hand only if auto speed detection doesn't work")
+    elseif au.page == 1 then
+        au:Toggle("sp_weave", "Calm weave", V.sp_weave)
+        au:Tip("Lazy swings and loops toward each note, timed to arrive on the beat")
+        au:SliderInt("t_weave", "Weave amount", 0, 250, V.t_weave)
+        au:Tip("Few notes = big lazy swings, many notes = small timed weaves (%)")
+    else
+        au:SliderInt("t_tvar", "Timing variation", 0, 300, V.t_tvar)
+        au:Tip("How much each stop's timing is off (%)")
+        au:SliderInt("t_spread", "Aim spread", 0, 250, V.t_spread)
+        au:Tip("How far from the center it aims (%)")
+        au:SliderInt("t_miss", "Miss chance", 0, 300, V.t_miss)
+        au:Tip("How often Autoplay: Light misses on purpose (%)")
     end
 end)
 
@@ -1549,28 +1541,21 @@ end)
 --========================================--
 
 local function remove_tabs()
+    pcall(UI.RemoveTab, TAB_SET)
     pcall(UI.RemoveTab, TAB_MAIN)
-    pcall(UI.RemoveTab, TAB_AUTO)
-    pcall(UI.RemoveTab, TAB_ASSIST)
-    pcall(UI.RemoveTab, TAB_TUNE)
 end
 
 kill = function()
     if not alive then return end
     alive = false
     vel_x, vel_y = 0, 0
-    remove_tabs()
-    task.spawn(function()
-        task.wait(0.1)
-        if _G.SP_GEN == MY_GEN then
-            remove_tabs()
-            task.wait(0.4)
-            remove_tabs()
-        end
-    end)
-    if _G.SP_STOP == kill then _G.SP_STOP = nil end
     if P.circ then pcall(function() P.circ:Remove() end) P.circ = nil end
     _G.SP_APPLY = nil
+    if _G.SP_STOP == kill then _G.SP_STOP = nil end
+    task.spawn(function()
+        task.wait(0.2)           -- let the current frame finish before touching the menu
+        remove_tabs()
+    end)
     print("[SP] unloaded")
 end
 _G.SP_STOP = kill
@@ -1589,32 +1574,28 @@ end
 
 task.spawn(function()
     while alive do
+        if UNLOAD_REQ then task.wait(0.15) kill() return end
         task.wait()
         if isrbxactive() then
             if pressed("assist", KEY_ASSIST) then
-                mode = 1
-                sv("sp_mode", 0)
+                put("sp_mode", 0)
                 say("Assist")
             end
             if pressed("light", KEY_LIGHT) then
-                mode = 2
-                sv("sp_mode", 1)
+                put("sp_mode", 1)
                 say("Autoplay: Light")
             end
             if pressed("blatant", KEY_BLATANT) then
-                mode = 3
-                sv("sp_mode", 2)
+                put("sp_mode", 2)
                 say("Autoplay: Blatant")
             end
             if pressed("nw", KEY_NOWAIT) then
-                nowait_on = not nowait_on
-                sv("sp_nowait", nowait_on)
-                say(nowait_on and "Look-ahead: ON" or "Look-ahead: OFF")
+                put("sp_nowait", not V.sp_nowait)
+                say(V.sp_nowait and "Look-ahead: ON" or "Look-ahead: OFF")
             end
             if pressed("tog", KEY_TOGGLE) then
-                enabled = not enabled
-                sv("sp_on", enabled)
-                say(enabled and "Resumed" or "Paused")
+                put("sp_on", not V.sp_on)
+                say(V.sp_on and "Resumed" or "Paused")
             end
             if pressed("kill", KEY_KILL) then kill() return end
         else
