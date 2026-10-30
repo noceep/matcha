@@ -7,7 +7,7 @@ local alive = true
 UNLOAD_REQ = false
 
 --========================================--
--- SETTINGS (plain globals, to stay under the 200-local limit)
+-- SETTINGS 
 --========================================--
 
 LOOP_DT    = 1/120
@@ -152,7 +152,7 @@ SYNC = {
     { "t_fs",     "fs",     100 }, { "t_fov",    "fov",    1 },
 }
 
--- default loaded config (also the "Legit AP" preset)
+-- default loaded config (also the "Preset 1" preset)
 LEG = {
     sp_mode = 1, sp_hit = false,
     t_speed = 180, t_smooth = 180, t_range = 200, t_accel = 30, t_sens = 3.15,
@@ -178,7 +178,7 @@ for id, v in pairs(LEG) do V[id] = v end
 -- weave per-stop data
 local W = { s = {}, n = {}, l = {}, r = {}, a = {} }
 -- live values shown in the menu
-local P = { calm = 0, save = 0, draw = false, preset = "Legit AP" }
+local P = { calm = 0, save = 0, draw = false, preset = "Preset 1" }
 
 local function gv(id, d)
     local ok, v = pcall(UI.GetValue, id)
@@ -1372,8 +1372,8 @@ _G.SP_APPLY = function(values)
 end
 
 PRESETS = {
-    ["Legit AP"] = LEG,
-    ["Assist Placeholder"] = {
+    ["Preset 1"] = LEG,
+    ["Placeholder"] = {
         sp_mode = 0, sp_hit = false,
         t_speed = 120, t_smooth = 120, t_range = 120, t_accel = 60, t_sens = 3.15,
         t_pull = 80, t_var = 60, t_curve = 100, t_drift = 60, t_hit = 60, t_idle = 100,
@@ -1389,7 +1389,7 @@ local function apply_preset(name)
     say("Preset: " .. name)
 end
 
-local function reset_tuning() apply_preset("Legit AP") end
+local function reset_tuning() apply_preset("Preset 1") end
 
 local kill -- forward declaration
 
@@ -1423,8 +1423,8 @@ UI.AddTab(TAB_MAIN, function(tab)
 
     local pr = tab:Section("Presets", "Right")
     pr:Text("Current: " .. P.preset)
-    pr:Button("Legit AP", function() apply_preset("Legit AP") end)
-    pr:Button("Assist Placeholder", function() apply_preset("Assist Placeholder") end)
+    pr:Button("Preset 1", function() apply_preset("Preset 1") end)
+    pr:Button("Placeholder", function() apply_preset("Placeholder") end)
     pr:Button("Reset all", reset_tuning)
 
     local h = tab:Section("Hotkeys", "Right")
